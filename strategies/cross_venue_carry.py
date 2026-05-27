@@ -104,6 +104,143 @@ class CrossVenueStrategy:
         # bot continues running for telemetry. Reset only by restart.
         self._portfolio_killed: bool = False
 
+        # Lighter collateral snapshot at position entry — used to compute
+        # funding delta in poll_lighter_funding (no dedicated funding history API).
+        self._lt_collateral_at_entry: Dict[str, float] = {}
+
+    # ── State recovery on restart ─────────────────────────────────────────────
+
+    async def recover_open_positions(self) -> None:
+        """
+        Called once at startup — reconcile DB OPEN cycles with real exchange positions.
+
+        For each OPEN cycle in DB:
+          • Both legs confirmed on exchange  → restore as HOLD (prevents layering)
+          • Neither leg found               → mark DB ABANDONED (ghost cleanup)
+          • Only one leg found              → taker-close the orphan leg + ABANDONED
+
+        Without this, a restart during an open position causes the new session to
+        open a duplicate position on top of the orphan → doubled margin → emergency_margin
+        fires immediately → position closed 30 min later with a fee loss.
+        """
+        import aiosqlite as _aiosqlite
+
+        try:
+            async with get_db() as conn:
+                conn.row_factory = _aiosqlite.Row
+                cur  = await conn.execute(
+                    "SELECT * FROM cross_venue_cycles WHERE state='OPEN'"
+                )
+                rows = await cur.fetchall()
+        except Exception as e:
+            crash_log("CrossVenue.recover_open_positions.db_read", e)
+            return
+
+        if not rows:
+            log("CrossVenue.recover: no OPEN DB cycles — starting fresh")
+            return
+
+        log(f"CrossVenue.recover: found {len(rows)} OPEN cycle(s) in DB — checking exchange")
+
+        for row in rows:
+            r = dict(row)
+
+            asset    = r["asset"]
+            cycle_id = r["id"]
+            units    = float(r["units"] or 0)
+            short_v  = r["short_venue"]
+            long_v   = r["long_venue"]
+
+            # Check both legs on exchange
+            try:
+                hl_size = await self._hl.get_perp_position_size(asset)
+            except Exception as e:
+                log_warn(f"CrossVenue.recover: {asset} HL check failed: {e}")
+                hl_size = -1.0  # unknown
+
+            try:
+                lt_pos  = await self._lt.get_position_for_asset(asset)
+                lt_size = abs(float((lt_pos or {}).get("base_amount", 0) or 0))
+            except Exception as e:
+                log_warn(f"CrossVenue.recover: {asset} Lighter check failed: {e}")
+                lt_size = -1.0  # unknown
+
+            threshold = max(units * 0.5, 0.001)
+            hl_ok  = (hl_size >= threshold)
+            lt_ok  = (lt_size >= threshold)
+            hl_unk = (hl_size < 0)
+            lt_unk = (lt_size < 0)
+            now    = int(time.time())
+
+            if hl_ok and lt_ok:
+                # ── Both legs live — restore as HOLD ──────────────────────
+                pos = CrossVenuePosition(
+                    asset=asset,
+                    state=CrossVenueState.HOLD,
+                    short_venue=short_v,
+                    long_venue=long_v,
+                    notional_usd=float(r["notional_usd"] or 0),
+                    units=units,
+                    hl_entry_price=float(r["hl_entry_price"] or 0),
+                    lighter_entry_price=float(r["lighter_entry_price"] or 0),
+                    hl_rate_at_entry=float(r["hl_rate_at_entry"] or 0),
+                    lighter_rate_at_entry=float(r["lighter_rate_at_entry"] or 0),
+                    spread_at_entry=float(r["spread_at_entry"] or 0),
+                    entered_at=r["entered_at"],
+                    entry_fee_usd=float(r["entry_fee_usd"] or 0),
+                    hl_funding_collected=float(r["hl_funding_collected"] or 0),
+                    lighter_funding_collected=float(r["lighter_funding_collected"] or 0),
+                    cycle_id=cycle_id,
+                )
+                self.positions[asset] = pos
+                age_h = (now - int(r["entered_at"] or now)) / 3600
+                log(
+                    f"CrossVenue.recover: {asset} RESTORED to HOLD — "
+                    f"HL={hl_size:.4f} LT={lt_size:.4f} units={units:.4f} "
+                    f"age={age_h:.1f}h"
+                )
+
+            elif not hl_ok and not lt_ok and not hl_unk and not lt_unk:
+                # ── No legs on exchange — ghost ───────────────────────────
+                async with get_db() as c2:
+                    await c2.execute(
+                        "UPDATE cross_venue_cycles SET state='ABANDONED', exited_at=?, "
+                        "exit_reason='db_ghost_no_exchange_position' WHERE id=?",
+                        (now, cycle_id)
+                    )
+                    await c2.commit()
+                log(f"CrossVenue.recover: {asset} ABANDONED (DB ghost)")
+
+            else:
+                # ── Partial / unknown — close what exists, mark abandoned ─
+                log_warn(
+                    f"CrossVenue.recover: {asset} PARTIAL — "
+                    f"HL={hl_size:.4f} LT={lt_size:.4f} — closing orphan leg(s)"
+                )
+                if hl_ok:
+                    try:
+                        hl_is_buy = (long_v == "hl")  # close: flip direction
+                        await self._hl.place_taker(
+                            asset, is_buy=hl_is_buy, size=hl_size, reduce_only=True
+                        )
+                        log(f"CrossVenue.recover: {asset} HL orphan closed (taker)")
+                    except Exception as e:
+                        crash_log(f"CrossVenue.recover.close_hl.{asset}", e)
+                if lt_ok:
+                    try:
+                        lt_is_buy = (long_v == "lighter")  # close: flip direction
+                        await self._lt.place_taker(asset, is_buy=lt_is_buy, size=lt_size)
+                        log(f"CrossVenue.recover: {asset} Lighter orphan closed (taker)")
+                    except Exception as e:
+                        crash_log(f"CrossVenue.recover.close_lt.{asset}", e)
+                async with get_db() as c2:
+                    await c2.execute(
+                        "UPDATE cross_venue_cycles SET state='ABANDONED', exited_at=?, "
+                        "exit_reason='recover_partial_close' WHERE id=?",
+                        (now, cycle_id)
+                    )
+                    await c2.commit()
+
     # ── Main tick ─────────────────────────────────────────────────────────────
 
     async def tick(self) -> None:
@@ -297,6 +434,18 @@ class CrossVenueStrategy:
         pos.entry_fee_usd += 0.0  # Lighter maker fee = 0%
         pos.mark_entered()
 
+        # Snapshot Lighter collateral at entry — baseline for poll_lighter_funding delta.
+        # (Lighter has no funding history API; we compute funding as collateral change.)
+        try:
+            lt_acct = await self._lt.get_account()
+            self._lt_collateral_at_entry[asset] = float(lt_acct.get("collateral", 0) or 0)
+            log(
+                f"CrossVenue: {asset} Lighter collateral baseline "
+                f"= ${self._lt_collateral_at_entry[asset]:.4f}"
+            )
+        except Exception:
+            pass  # poll_lighter_funding will set baseline on first poll if this fails
+
         # Persist to DB
         cycle_id = str(uuid.uuid4())
         pos.cycle_id = cycle_id
@@ -414,7 +563,8 @@ class CrossVenueStrategy:
         await self._db_update_cycle(pos, reason)
 
         self._stats.total_pnl_usd += pos.total_pnl_usd
-        self._stats.total_funding_usd += pos.net_funding_usd
+        # NOTE: total_funding_usd is updated INCREMENTALLY by poll_lighter_funding()
+        # and record_hl_funding() — do NOT add pos.net_funding_usd here (double-count).
         self._stats.total_fees_usd += pos.entry_fee_usd + pos.exit_fee_usd
         if hl_ok and lt_ok:
             self._stats.successful_cycles += 1
@@ -585,15 +735,41 @@ class CrossVenueStrategy:
             crash_log("CrossVenue._check_rebalance", e)
 
     async def _hl_margin_ratio(self) -> float:
-        """Compute HL margin usage ratio from clearinghouse state."""
+        """
+        Compute HL margin usage ratio: totalMarginUsed / totalEquity.
+
+        On unified HL accounts, USDC sits in spot — NOT in the perp account.
+        This means marginSummary.accountValue ≈ $0-2 (residual perp-side P&L),
+        while actual capital is in spot. Dividing tiny margin_used by this near-zero
+        denominator produces a falsely high ratio and triggers spurious emergencies.
+
+        Fix: if accountValue < margin_used (nonsensical) or < $10 (suspiciously small),
+        fall back to the actual USDC spot balance as the denominator.
+        """
         try:
             state = await self._hl.get_clearinghouse()
-            margin_summary = state.get("marginSummary", {})
+            # Try crossMarginSummary first (more accurate for cross-margin perp positions)
+            margin_summary = (
+                state.get("crossMarginSummary")
+                or state.get("marginSummary")
+                or {}
+            )
             account_value = float(margin_summary.get("accountValue", 0) or 0)
-            margin_used = float(margin_summary.get("totalMarginUsed", 0) or 0)
+            margin_used   = float(margin_summary.get("totalMarginUsed", 0) or 0)
+
+            # Unified account guard: if accountValue looks wrong, use spot USDC balance
+            if account_value < 10.0 or account_value < margin_used:
+                account_value = await self._hl.get_usdc_balance()
+
             if account_value <= 0:
                 return 0.0
-            return margin_used / account_value
+            ratio = margin_used / account_value
+            from core.logger import log as _log
+            _log(
+                f"HL margin check: used=${margin_used:.2f} equity=${account_value:.2f} "
+                f"ratio={ratio*100:.1f}%"
+            )
+            return ratio
         except Exception as e:
             crash_log("CrossVenue._hl_margin_ratio", e)
             return 0.0
@@ -612,16 +788,79 @@ class CrossVenueStrategy:
 
     async def poll_lighter_funding(self) -> None:
         """
-        Poll Lighter for new funding payments.
-        Called periodically (e.g. every 5 min) since Lighter has 1h settlement.
+        Poll BOTH venues for new funding via REST. Called every LT_FUNDING_POLL seconds.
+
+        HL leg  — reads cumFunding.sinceOpen from clearinghouse REST.  We store the
+                   absolute total received since position opened and compute deltas, so
+                   this is safe to call even when WebSocket is also delivering events
+                   (WS events set hl_funding_collected directly; REST resets to ground
+                   truth).  Net effect: if WS works, no stat double-count; if WS is
+                   blocked, REST picks up the full amount.
+
+        Lighter leg — Lighter has no funding history endpoint.  We approximate by
+                      tracking the account `collateral` field: collateral rises as
+                      funding is credited.  Baseline is snapshotted at position entry;
+                      delta since baseline = funding received.
+                      NOTE: valid only for CROSS_MAX_POSITIONS = 1 (single position).
+                      With multiple simultaneous positions the collateral delta cannot
+                      be attributed per-asset.  Extend this if MAX_POSITIONS ever > 1.
         """
         if not self.positions:
             return
+
+        # ── HL: cumFunding.sinceOpen from clearinghouse REST ─────────────────
         try:
-            lt_account = await self._lt.get_account()
-            # TODO: implement parsing of Lighter's funding payment history once
-            # the positionFunding endpoint format is confirmed.
-            # For now, approximate from PnL delta.
+            state = await self._hl.get_clearinghouse()
+            for ap in state.get("assetPositions", []):
+                pos_data = ap.get("position", {})
+                asset    = pos_data.get("coin", "")
+                pos      = self.positions.get(asset)
+                if pos is None or pos.state != CrossVenueState.HOLD:
+                    continue
+                cum        = pos_data.get("cumFunding", {})
+                since_open = float(cum.get("sinceOpen", 0) or 0)
+                # sinceOpen is the absolute total since position opened — assign
+                # directly and compute delta so we don't double-add WS events.
+                delta = since_open - pos.hl_funding_collected
+                if abs(delta) > 0.000001:
+                    pos.hl_funding_collected = since_open
+                    self._stats.total_funding_usd += delta
+                    log(
+                        f"HLFunding[REST]: {asset} cumSinceOpen=${since_open:+.5f} "
+                        f"(delta=${delta:+.5f})"
+                    )
+                    await self._db_update_funding(pos)
+        except Exception as e:
+            crash_log("CrossVenue.poll_hl_funding_rest", e)
+
+        # ── Lighter: collateral delta (no funding history API) ────────────────
+        try:
+            lt_acct            = await self._lt.get_account()
+            current_collateral = float(lt_acct.get("collateral", 0) or 0)
+            if current_collateral <= 0:
+                return
+
+            for asset, pos in list(self.positions.items()):
+                if pos.state != CrossVenueState.HOLD:
+                    continue
+                baseline = self._lt_collateral_at_entry.get(asset)
+                if baseline is None:
+                    # Entry snapshot was not captured — set baseline now.
+                    # Any funding credited before this snapshot is lost; acceptable.
+                    self._lt_collateral_at_entry[asset] = current_collateral
+                    log(f"LighterFunding: {asset} baseline set (late) = ${current_collateral:.4f}")
+                    continue
+                delta = current_collateral - baseline
+                if delta > 0.000001:
+                    pos.lighter_funding_collected += delta
+                    self._stats.total_funding_usd += delta
+                    # Advance baseline so next poll captures only NEW funding.
+                    self._lt_collateral_at_entry[asset] = current_collateral
+                    log(
+                        f"LighterFunding: {asset} +${delta:.5f} "
+                        f"(collateral ${current_collateral:.4f})"
+                    )
+                    await self._db_update_funding(pos)
         except Exception as e:
             crash_log("CrossVenue.poll_lighter_funding", e)
 
@@ -677,8 +916,9 @@ class CrossVenueStrategy:
         try:
             async with get_db() as conn:
                 await conn.execute(
-                    "UPDATE cross_venue_cycles SET hl_funding_collected=? WHERE id=?",
-                    (pos.hl_funding_collected, pos.cycle_id),
+                    "UPDATE cross_venue_cycles SET "
+                    "hl_funding_collected=?, lighter_funding_collected=? WHERE id=?",
+                    (pos.hl_funding_collected, pos.lighter_funding_collected, pos.cycle_id),
                 )
                 await conn.commit()
         except Exception as e:

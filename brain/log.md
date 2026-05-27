@@ -6,6 +6,10 @@
 
 ## 2026-05-27
 
+`2026-05-27 23:10 | strategies/cross_venue_carry.py + main_cross.py | BUGFIX BUG-019 — emergency_margin fires after every restart with open positions. Root cause: no state recovery → position layering → doubled totalMarginUsed → ratio>65% immediately. Added CrossVenueStrategy.recover_open_positions(): reads OPEN DB cycles, checks exchange legs, restores HOLD or marks ABANDONED. Called in main_cross.py after strategy init.`
+
+`2026-05-27 22:43 | venues/lighter.py | BUGFIX BUG-018 — cancel_all_orders(time_in_force=None) → ctypes ArgumentError. SignCancelAllOrders C binding requires int; changed to CANCEL_ALL_TIF_IMMEDIATE=0.`
+
 `2026-05-27 17:30 | strategies/cross_venue_carry.py + feeds/spread_scanner.py + core/constants.py + main_cross.py | 4 улучшения после сравнения с Gajesh2007/funding-arb-bot: (1) sigma-фильтр на вход — отбрасывает funding spikes >2σ от 24ч среднего; (2) price divergence guard — taker-exit если HL/Lighter mid разъехались >2%; (3) portfolio drawdown kill switch — стоп новых входов при session P&L < -$8 (отдельно от CB2 SESSION_LOSS_FLOOR=-$15 в main); (4) periodic drift check каждые 5 мин — реконсилиация booked vs actual size, аварийное закрытие если одна нога <50% ожидаемого размера. Новые константы: SPIKE_SIGMA_THRESHOLD=2.0, SPIKE_HISTORY_MIN_SAMPLES=12, PRICE_DIVERGENCE_KILL_PCT=0.02, PORTFOLIO_DRAWDOWN_KILL_USD=8.0, DRIFT_CHECK_INTERVAL_S=300, DRIFT_TOLERANCE_PCT=0.05.`
 
 ---

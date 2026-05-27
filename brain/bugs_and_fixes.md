@@ -94,6 +94,16 @@ Format: **Error → Cause → Fix → File**
 - Fix: 3-layer dedup: (1) in-memory `_seen_fundings` set by `(asset, paid_at_ms)`; (2) `UNIQUE INDEX uq_payments_asset_time` + `INSERT OR IGNORE`; (3) temporal guard — ignore events where `paid_at < pos.entered_at * 1000`
 - File: `strategies/funding_carry.py`, `schema.sql`
 
+**BUG-019** `emergency_margin` fires immediately after position open → closes after 30 min (fee loss)
+- Cause: no state recovery on `CrossVenueStrategy.__init__`. Restart during open position → new session opens duplicate position on top of orphan → `totalMarginUsed` doubles → `margin_used/usdc_balance` spikes above 65% threshold immediately → `_EMERGENCY_CLOSE_AFTER_S=1800s` timer runs to completion.
+- Fix: `CrossVenueStrategy.recover_open_positions()` — reads OPEN DB cycles, checks exchange (HL `get_perp_position_size` + Lighter `get_position_for_asset`), restores to HOLD or marks ABANDONED/partial-close. Called in `main_cross.py` after strategy init, before tick loop.
+- File: `strategies/cross_venue_carry.py:recover_open_positions`, `main_cross.py`
+
+**BUG-018** `ArgumentError: argument 1: TypeError: 'NoneType' object cannot be interpreted as an integer` in `cancel_order`
+- Cause: `cancel_all_orders(time_in_force=None)` — the SDK's `sign_cancel_all_orders` passes the value directly to a ctypes C function `SignCancelAllOrders`, which requires an integer. `None` crashes ctypes at argument 1.
+- Fix: `time_in_force=self._signer.CANCEL_ALL_TIF_IMMEDIATE` (value `0`). Old comment claiming `None` was required was a server-error misread.
+- File: `venues/lighter.py:cancel_order`
+
 ---
 
 ## TESTNET KNOWN LIMITATIONS

@@ -58,6 +58,9 @@ class LighterClient:
         # SDK SignerClient — lazily initialised on first trading call
         self._signer: Any = None
 
+        # Monotonic counter for client_order_index (unique per order)
+        self._order_counter: int = 0
+
     # ── HTTP helpers ──────────────────────────────────────────────────────────
 
     async def _session_(self) -> aiohttp.ClientSession:
@@ -330,34 +333,8 @@ class LighterClient:
         return self._order_counter
 
     # ── Open order lookup for cancellation ────────────────────────────────────
-
-    async def _find_order_index(
-        self, market_id: int, client_order_index: int
-    ) -> Optional[int]:
-        """
-        Query REST API for the book-level order_index needed by cancel_order.
-        Matches by client_order_index (our unique counter per placed order).
-        """
-        try:
-            data = await self._get(
-                "/orders",
-                params={
-                    "owner_account_index": self._account_index,
-                    "market_id": market_id,
-                    "status": "open",
-                    "limit": 50,
-                },
-            )
-            for order in data.get("orders", []):
-                if int(order.get("client_order_index", -1)) == client_order_index:
-                    return int(order["order_index"])
-            # Fallback: return the first open order if only one exists
-            orders = data.get("orders", [])
-            if len(orders) == 1:
-                return int(orders[0]["order_index"])
-        except Exception as e:
-            crash_log("LighterClient._find_order_index", e)
-        return None
+    # NOTE: GET /orders requires auth we don't pass via plain REST — use SDK
+    # cancel_all_orders instead (see cancel_order below).
 
     # ── Order placement ───────────────────────────────────────────────────────
 
@@ -458,29 +435,26 @@ class LighterClient:
 
     async def cancel_order(self, asset: str, order_id: str) -> bool:
         """
-        Cancel by client_order_index (str). Queries REST to get book order_index,
-        then cancels via SDK. Returns True on success.
+        Cancel all open orders via SDK cancel_all_orders (IMMEDIATE).
+
+        Why cancel_all instead of cancel_order:
+          GET /orders endpoint requires REST auth we don't pass, so we cannot
+          look up the book-level order_index needed by cancel_order(order_index=...).
+          cancel_all_orders is a single SDK tx that reliably purges all resting
+          orders — safe for our bot because we run one position at a time.
         """
         self._init_signer()
-        await self._ensure_markets()
-        mkt = self._markets.get(asset.upper())
-        if mkt is None:
-            return False
         try:
-            client_idx = int(order_id)
-            market_id = int(mkt["market_id"])
-            book_order_idx = await self._find_order_index(market_id, client_idx)
-            if book_order_idx is None:
-                log_warn(f"LighterClient.cancel_order: {asset} order not found (may be filled)")
-                return True  # treat as filled/already gone
-            _, resp, error = await self._signer.cancel_order(
-                market_index=market_id,
-                order_index=book_order_idx,
+            # CANCEL_ALL_TIF_IMMEDIATE = 0 — SDK ctypes binding requires an int, None crashes.
+            # Previous comment claiming None was required was wrong (was a server-error misread).
+            _, resp, error = await self._signer.cancel_all_orders(
+                time_in_force=self._signer.CANCEL_ALL_TIF_IMMEDIATE,
+                timestamp_ms=int(time.time() * 1000),
             )
             if error:
-                log_warn(f"LighterClient.cancel_order: {asset} SDK error: {error}")
+                log_warn(f"LighterClient.cancel_order: {asset} cancel_all error: {error}")
                 return False
-            log(f"LighterClient: cancelled {asset} order idx={book_order_idx}")
+            log(f"LighterClient: cancel_all_orders OK (triggered by {asset} repost)")
             return True
         except Exception as e:
             crash_log(f"LighterClient.cancel_order.{asset}", e)
@@ -540,8 +514,16 @@ class LighterClient:
                     log(f"LighterClient.maker_chase: {label_str}{asset} FILLED @ {price}")
                     return order_id
 
-            # Not filled → cancel and try again at new price
-            await self.cancel_order(asset, order_id)
+            # Not filled → cancel and try again at new price.
+            # IMPORTANT: if cancel fails, abort immediately — continuing would place
+            # a new order on top of the unfilled one, accumulating orphaned orders.
+            cancelled = await self.cancel_order(asset, order_id)
+            if not cancelled:
+                log_warn(
+                    f"LighterClient.maker_chase: {label_str}{asset} "
+                    f"cancel failed at attempt {attempt+1} — aborting to prevent order accumulation"
+                )
+                return None
 
         log_warn(f"LighterClient.maker_chase: {label_str}{asset} exhausted {max_reposts} reposts")
         return None

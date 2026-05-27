@@ -157,6 +157,18 @@ async def carry_loop() -> None:
     dash.opportunities = candidates
     dlog(f"Warm-up complete — {len(candidates)} spread opportunities found", "ok")
 
+    # ── State recovery: restore open positions from DB ───────────────────────
+    dlog("State recovery: checking for open positions from previous session...")
+    await strategy.recover_open_positions()
+    if strategy.positions:
+        dlog(
+            f"State recovery: restored {len(strategy.positions)} position(s): "
+            f"{', '.join(strategy.positions.keys())}",
+            "ok"
+        )
+    else:
+        dlog("State recovery: no open positions to restore", "ok")
+
     # ── Verify balances (read-only check) ────────────────────────────────────
     try:
         dash.hl_balance = await hl_client.get_usdc_balance()
