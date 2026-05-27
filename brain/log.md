@@ -6,6 +6,8 @@
 
 ## 2026-05-27
 
+`2026-05-27 23:50 | strategies/cross_venue_carry.py | ЧЕСТНЫЙ P&L — 3 улучшения точности учёта: (1) Lighter funding: заменён account-level collateral delta (сломан при >1 позиций) на rate×time×notional per position — _lt_last_funding_poll[asset] таймер, poll_lighter_funding теперь начисляет sign×rate×notional_usd×elapsed_hours независимо по каждому асету; (2) Фактическая цена входа HL: сразу после fill читаем entryPx из get_clearinghouse() (не mark_price) — логируем slippage%; (3) Фактическая цена входа Lighter: get_position_for_asset().entry_price после fill (не bid/ask mid) — логируем slippage%. Cleanup: _lt_last_funding_poll.pop + _lt_collateral_at_entry.pop при закрытии позиции.`
+
 `2026-05-27 23:10 | strategies/cross_venue_carry.py + main_cross.py | BUGFIX BUG-019 — emergency_margin fires after every restart with open positions. Root cause: no state recovery → position layering → doubled totalMarginUsed → ratio>65% immediately. Added CrossVenueStrategy.recover_open_positions(): reads OPEN DB cycles, checks exchange legs, restores HOLD or marks ABANDONED. Called in main_cross.py after strategy init.`
 
 `2026-05-27 22:43 | venues/lighter.py | BUGFIX BUG-018 — cancel_all_orders(time_in_force=None) → ctypes ArgumentError. SignCancelAllOrders C binding requires int; changed to CANCEL_ALL_TIF_IMMEDIATE=0.`

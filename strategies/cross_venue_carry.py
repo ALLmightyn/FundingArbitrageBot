@@ -104,9 +104,14 @@ class CrossVenueStrategy:
         # bot continues running for telemetry. Reset only by restart.
         self._portfolio_killed: bool = False
 
-        # Lighter collateral snapshot at position entry — used to compute
-        # funding delta in poll_lighter_funding (no dedicated funding history API).
+        # Lighter collateral snapshot at position entry — kept as secondary sanity
+        # check for single-position mode; NOT the primary funding source anymore.
         self._lt_collateral_at_entry: Dict[str, float] = {}
+
+        # Per-position timestamp of the last Lighter funding poll.
+        # Primary funding tracker: rate × elapsed_hours × notional_usd per position.
+        # Valid for any CROSS_MAX_POSITIONS (unlike account-level collateral delta).
+        self._lt_last_funding_poll: Dict[str, float] = {}
 
     # ── State recovery on restart ─────────────────────────────────────────────
 
@@ -193,6 +198,9 @@ class CrossVenueStrategy:
                     cycle_id=cycle_id,
                 )
                 self.positions[asset] = pos
+                # Start the Lighter funding poll timer from now — any funding that
+                # accrued before recovery is already captured in DB / pos fields.
+                self._lt_last_funding_poll[asset] = float(now)
                 age_h = (now - int(r["entered_at"] or now)) / 3600
                 log(
                     f"CrossVenue.recover: {asset} RESTORED to HOLD — "
@@ -402,9 +410,29 @@ class CrossVenueStrategy:
             return
 
         pos.hl_order_id = hl_order_id
-        pos.hl_entry_price = mark_price  # approximate; actual fill logged by HL
+        pos.hl_entry_price = mark_price  # will be refined below from clearinghouse
         pos.entry_fee_usd += CROSS_POSITION_SIZE_USD * FEE_PERP_MAKER
-        log(f"CrossVenue: {asset} HL leg filled — now opening Lighter leg")
+
+        # Read actual HL fill price from clearinghouse (entryPx is the real avg fill).
+        # mark_price was just the mid at order time — can differ by 0.1-0.3% on volatility.
+        try:
+            cl_state = await self._hl.get_clearinghouse()
+            for ap in cl_state.get("assetPositions", []):
+                p = ap.get("position", {})
+                if p.get("coin") == asset:
+                    entry_px = float(p.get("entryPx", 0) or 0)
+                    if entry_px > 0:
+                        slippage_pct = abs(entry_px - mark_price) / mark_price * 100
+                        pos.hl_entry_price = entry_px
+                        log(
+                            f"CrossVenue: {asset} HL actual fill={entry_px:.6f} "
+                            f"(mark was {mark_price:.6f}, slip={slippage_pct:.3f}%)"
+                        )
+                    break
+        except Exception:
+            pass  # mark_price approximation stands
+
+        log(f"CrossVenue: {asset} HL leg filled @ {pos.hl_entry_price:.6f} — now opening Lighter leg")
 
         # ── Step 2: Open Lighter leg ──────────────────────────────────────────
         lt_label = f"Lighter {'short' if not lt_is_buy else 'long'}"
@@ -428,23 +456,34 @@ class CrossVenueStrategy:
             return
 
         # ── Both legs filled ──────────────────────────────────────────────────
-        lt_bid, lt_ask = await self._lt.get_best_prices(asset)
-        pos.lighter_entry_price = lt_ask if lt_is_buy else lt_bid
+        # Get actual Lighter fill price from live position data (entry_price is the
+        # real avg fill — more accurate than order-book mid at order time).
+        try:
+            lt_pos_actual = await self._lt.get_position_for_asset(asset)
+            lt_actual_entry = float((lt_pos_actual or {}).get("entry_price", 0) or 0)
+            if lt_actual_entry > 0:
+                lt_bid_now, lt_ask_now = await self._lt.get_best_prices(asset)
+                lt_mid = (lt_bid_now + lt_ask_now) / 2 if lt_ask_now > 0 else lt_actual_entry
+                lt_slip_pct = abs(lt_actual_entry - lt_mid) / lt_mid * 100 if lt_mid > 0 else 0
+                pos.lighter_entry_price = lt_actual_entry
+                log(
+                    f"CrossVenue: {asset} Lighter actual fill={lt_actual_entry:.6f} "
+                    f"(mid≈{lt_mid:.6f}, slip={lt_slip_pct:.3f}%)"
+                )
+            else:
+                lt_bid_now, lt_ask_now = await self._lt.get_best_prices(asset)
+                pos.lighter_entry_price = lt_ask_now if lt_is_buy else lt_bid_now
+        except Exception:
+            lt_bid_now, lt_ask_now = await self._lt.get_best_prices(asset)
+            pos.lighter_entry_price = lt_ask_now if lt_is_buy else lt_bid_now
+
         pos.lighter_order_id = lt_order_id
         pos.entry_fee_usd += 0.0  # Lighter maker fee = 0%
         pos.mark_entered()
 
-        # Snapshot Lighter collateral at entry — baseline for poll_lighter_funding delta.
-        # (Lighter has no funding history API; we compute funding as collateral change.)
-        try:
-            lt_acct = await self._lt.get_account()
-            self._lt_collateral_at_entry[asset] = float(lt_acct.get("collateral", 0) or 0)
-            log(
-                f"CrossVenue: {asset} Lighter collateral baseline "
-                f"= ${self._lt_collateral_at_entry[asset]:.4f}"
-            )
-        except Exception:
-            pass  # poll_lighter_funding will set baseline on first poll if this fails
+        # Initialize per-position Lighter funding poll timer.
+        # poll_lighter_funding() will accrue rate × elapsed_hours × notional from here.
+        self._lt_last_funding_poll[asset] = time.time()
 
         # Persist to DB
         cycle_id = str(uuid.uuid4())
@@ -571,6 +610,8 @@ class CrossVenueStrategy:
 
         # Remove from active positions and set cooldown
         self.positions.pop(asset, None)
+        self._lt_last_funding_poll.pop(asset, None)
+        self._lt_collateral_at_entry.pop(asset, None)
         self._set_cooldown(asset)
 
         await self._notify(
@@ -797,13 +838,12 @@ class CrossVenueStrategy:
                    truth).  Net effect: if WS works, no stat double-count; if WS is
                    blocked, REST picks up the full amount.
 
-        Lighter leg — Lighter has no funding history endpoint.  We approximate by
-                      tracking the account `collateral` field: collateral rises as
-                      funding is credited.  Baseline is snapshotted at position entry;
-                      delta since baseline = funding received.
-                      NOTE: valid only for CROSS_MAX_POSITIONS = 1 (single position).
-                      With multiple simultaneous positions the collateral delta cannot
-                      be attributed per-asset.  Extend this if MAX_POSITIONS ever > 1.
+        Lighter leg — Lighter has no funding history endpoint.  We compute theoretical
+                      funding per position: sign × rate × notional_usd × elapsed_hours.
+                      Rate is read from the scanner snapshot (refreshed every 60s).
+                      This is an approximation (rate changes between polls) but is
+                      correct on average over hourly settlement periods and works for
+                      any number of simultaneous positions.
         """
         if not self.positions:
             return
@@ -833,36 +873,54 @@ class CrossVenueStrategy:
         except Exception as e:
             crash_log("CrossVenue.poll_hl_funding_rest", e)
 
-        # ── Lighter: collateral delta (no funding history API) ────────────────
+        # ── Lighter: rate × time × notional (valid for any CROSS_MAX_POSITIONS) ─
+        # Each position independently accrues: sign × rate × notional × elapsed_hours.
+        # sign = +1 if we're SHORT on Lighter (positive rate earns us money),
+        #        -1 if we're LONG  on Lighter (positive rate costs us money).
+        # Rate from scanner snapshot refreshed every 60s — accuracy is ±poll_interval.
+        # This replaces the old account-level collateral-delta approach which was
+        # broken whenever CROSS_MAX_POSITIONS > 1 (couldn't attribute per-asset).
         try:
-            lt_acct            = await self._lt.get_account()
-            current_collateral = float(lt_acct.get("collateral", 0) or 0)
-            if current_collateral <= 0:
-                return
-
+            now_s = time.time()
             for asset, pos in list(self.positions.items()):
                 if pos.state != CrossVenueState.HOLD:
                     continue
-                baseline = self._lt_collateral_at_entry.get(asset)
-                if baseline is None:
-                    # Entry snapshot was not captured — set baseline now.
-                    # Any funding credited before this snapshot is lost; acceptable.
-                    self._lt_collateral_at_entry[asset] = current_collateral
-                    log(f"LighterFunding: {asset} baseline set (late) = ${current_collateral:.4f}")
+
+                snap = self._scanner.get_snapshot(asset)
+                if snap is None:
                     continue
-                delta = current_collateral - baseline
-                if delta > 0.000001:
-                    pos.lighter_funding_collected += delta
-                    self._stats.total_funding_usd += delta
-                    # Advance baseline so next poll captures only NEW funding.
-                    self._lt_collateral_at_entry[asset] = current_collateral
+
+                last_poll = self._lt_last_funding_poll.get(asset)
+                if last_poll is None:
+                    # Timer not yet set (entry happened before this session?).
+                    # Initialize here; funding for the gap is untracked — acceptable.
+                    self._lt_last_funding_poll[asset] = now_s
+                    log(f"LighterFunding: {asset} poll timer initialized (late)")
+                    continue
+
+                elapsed_hours = (now_s - last_poll) / 3600.0
+                if elapsed_hours < 0.001:  # < 3.6s — ignore noise
+                    continue
+
+                # Positive Lighter rate → longs pay shorts (standard convention).
+                lt_is_short = (pos.short_venue == "lighter")
+                sign = 1.0 if lt_is_short else -1.0
+                theoretical = sign * snap.lighter_rate * pos.notional_usd * elapsed_hours
+
+                # Always advance the timer (even if theoretical ≈ 0 from low rate).
+                self._lt_last_funding_poll[asset] = now_s
+
+                if abs(theoretical) > 0.0000001:
+                    pos.lighter_funding_collected += theoretical
+                    self._stats.total_funding_usd += theoretical
                     log(
-                        f"LighterFunding: {asset} +${delta:.5f} "
-                        f"(collateral ${current_collateral:.4f})"
+                        f"LighterFunding[rate×time]: {asset} {theoretical:+.5f} "
+                        f"(rate={snap.lighter_rate*100:.4f}%/h × {elapsed_hours:.3f}h × "
+                        f"${pos.notional_usd:.0f}, {'short' if lt_is_short else 'long'})"
                     )
                     await self._db_update_funding(pos)
         except Exception as e:
-            crash_log("CrossVenue.poll_lighter_funding", e)
+            crash_log("CrossVenue.poll_lighter_funding_rate", e)
 
     # ── Database helpers ──────────────────────────────────────────────────────
 
