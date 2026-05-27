@@ -189,11 +189,17 @@ async def carry_loop() -> None:
                 if asset and amount != 0:
                     await strategy.record_hl_funding(asset, amount)
 
-    ws_subs = [
-        {"type": "userFundings", "user": hl_address},
-        {"type": "userEvents",   "user": hl_address},
-    ]
-    _fire(hl_client.ws_listen(ws_subs, _on_ws_message), "hl_ws_funding")
+    # HL WebSocket is optional — can be disabled in .env if network blocks WS.
+    # Without WS, funding payments are NOT tracked in real-time but the bot
+    # still trades normally. P&L will be computed at close from rate * hold_time.
+    if os.getenv("HL_WS_ENABLED", "true").lower() != "false":
+        ws_subs = [
+            {"type": "userFundings", "user": hl_address},
+            {"type": "userEvents",   "user": hl_address},
+        ]
+        _fire(hl_client.ws_listen(ws_subs, _on_ws_message), "hl_ws_funding")
+    else:
+        dlog("HL WebSocket disabled via HL_WS_ENABLED=false", "warn")
 
     # ── Background tasks ──────────────────────────────────────────────────────
     _fire(scanner.run_forever(), "spread_scanner")

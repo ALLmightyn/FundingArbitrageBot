@@ -32,6 +32,7 @@ _find_*.py
 _test_*.py
 _fetch_*.py
 _sdk_download/
+# _doctor.py and _scan_now.py are useful diagnostic tools, keep them tracked
 
 # IDE
 .vscode/

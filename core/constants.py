@@ -92,7 +92,10 @@ STATE_COOLDOWN = "COOLDOWN"
 STATE_KILLED = "KILLED"
 
 # ── Lighter API endpoints ─────────────────────────────────────────────────────
+# REST queries use /api/v1 path; SDK SignerClient appends it itself, so pass
+# the bare host for the SDK to avoid /api/v1/api/v1/nextNonce double-path.
 LIGHTER_BASE_URL: str = "https://mainnet.zklighter.elliot.ai/api/v1"
+LIGHTER_SDK_URL: str  = "https://mainnet.zklighter.elliot.ai"
 LIGHTER_EXPLORER_URL: str = "https://explorer.elliot.ai/api"
 
 # ── Cross-Venue Spread Thresholds ─────────────────────────────────────────────

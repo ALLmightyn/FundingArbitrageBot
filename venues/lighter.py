@@ -21,7 +21,7 @@ from typing import Dict, List, Optional, Any
 
 import aiohttp
 
-from core.constants import LIGHTER_BASE_URL, LIGHTER_EXPLORER_URL
+from core.constants import LIGHTER_BASE_URL, LIGHTER_SDK_URL, LIGHTER_EXPLORER_URL
 from core.logger import log, log_warn, crash_log
 
 _REQUEST_TIMEOUT = aiohttp.ClientTimeout(total=12)
@@ -304,8 +304,9 @@ class LighterClient:
                 "Or: uv pip install lighter-sdk (if PyPI accessible)"
             )
         # SignerClient.__init__ loads the DLL synchronously — safe to call here
+        # Pass bare host URL; SDK appends /api/v1 internally
         self._signer = SignerClient(
-            url=LIGHTER_BASE_URL,
+            url=LIGHTER_SDK_URL,
             account_index=self._account_index,
             api_private_keys={self._api_key_index: self._api_private_key},
         )
