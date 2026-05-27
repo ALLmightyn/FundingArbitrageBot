@@ -1,0 +1,9 @@
+python-dotenv>=1.0.0
+hyperliquid-python-sdk>=0.23.0
+websockets>=12.0
+aiosqlite>=0.20.0
+aiohttp>=3.9.0
+
+# Lighter SDK — required for main_cross.py order placement.
+# Install separately (not on PyPI):
+#   uv pip install git+https://github.com/elliottech/zklighter-perps-python.git

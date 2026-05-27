@@ -1,0 +1,50 @@
+# Secrets — NEVER commit
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Virtual environment
+.venv/
+venv/
+env/
+
+# Database (contains live trading data, not for source control)
+database/*.db
+database/*.db-shm
+database/*.db-wal
+
+# Logs
+logs/
+*.log
+
+# Temp/diagnostic scripts (not part of the bot)
+_check_*.py
+_find_*.py
+_test_*.py
+_fetch_*.py
+_sdk_download/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Firecrawl cache
+.firecrawl/
+
+# Claude local
+.claude/
