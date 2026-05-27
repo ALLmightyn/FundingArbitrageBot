@@ -255,7 +255,7 @@ class CrossVenueStrategy:
             asset=asset,
             is_buy=hl_is_buy,
             size=units,
-            label=hl_label,
+            side_label=hl_label,
         )
 
         if hl_order_id is None:
@@ -458,7 +458,7 @@ class CrossVenueStrategy:
                     asset=asset,
                     is_buy=is_buy,
                     size=pos.units,
-                    label=f"close_hl_{reduce_label}",
+                    side_label=f"close_hl_{reduce_label}",
                 )
                 if order_id is None:
                     # Fallback to taker

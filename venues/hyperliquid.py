@@ -162,6 +162,30 @@ class HLClient:
         state = await self._run(self._info.spot_user_state, self._address)
         return state.get("balances", [])
 
+    async def get_usdc_balance(self) -> float:
+        """
+        Return available USDC for trading.
+        On unified accounts, funds sit in spot as USDC and are used as
+        cross-margin collateral for perps — clearinghouseState shows $0.
+        Falls back to marginSummary.accountValue for non-unified accounts.
+        """
+        # Try spot USDC first (unified account)
+        try:
+            balances = await self.get_spot_balances()
+            for b in balances:
+                if b.get("coin") == "USDC":
+                    total = float(b.get("total", 0) or 0)
+                    hold  = float(b.get("hold", 0) or 0)
+                    return max(0.0, total - hold)
+        except Exception:
+            pass
+        # Fallback: perp accountValue (non-unified)
+        try:
+            state = await self.get_clearinghouse()
+            return float(state.get("marginSummary", {}).get("accountValue", 0) or 0)
+        except Exception:
+            return 0.0
+
     # ── Market data ───────────────────────────────────────────────────────────
 
     async def get_meta(self) -> Dict:
@@ -438,18 +462,21 @@ class HLClient:
         import websockets  # lazy import — optional dep at ws time
 
         backoff = 5
+        fails = 0
+        MAX_FAILS = 5  # give up after 5 consecutive failures (network blocked)
         while True:
             try:
                 log(f"WS: connecting to {self._ws_url}")
                 async with websockets.connect(
                     self._ws_url,
-                    ping_interval=None,  # HL ignores WS PING frames; use app-level heartbeat
+                    ping_interval=None,
                     close_timeout=5,
                 ) as ws:
                     for sub in subscriptions:
                         await ws.send(json.dumps({"method": "subscribe", "subscription": sub}))
                     log(f"WS: subscribed to {len(subscriptions)} channels")
-                    backoff = 5  # reset on successful connect
+                    backoff = 5
+                    fails = 0  # reset on successful connect
 
                     async def _heartbeat():
                         while True:
@@ -468,6 +495,15 @@ class HLClient:
                         hb_task.cancel()
 
             except Exception as e:
-                log_warn(f"WS: disconnected ({e}), reconnecting in {backoff}s...")
+                fails += 1
+                if fails >= MAX_FAILS:
+                    log_warn(
+                        f"WS: {fails} consecutive failures ({e}). "
+                        f"HL WebSocket appears blocked (VPN/proxy needed). "
+                        f"Funding payments will be tracked via REST polling instead. "
+                        f"WS disabled."
+                    )
+                    return  # exit loop silently — bot continues without WS
+                log_warn(f"WS: disconnected ({e}), reconnecting in {backoff}s... ({fails}/{MAX_FAILS})")
                 await asyncio.sleep(backoff)
-                backoff = min(backoff * 2, 60)  # exponential backoff, cap 60s
+                backoff = min(backoff * 2, 60)

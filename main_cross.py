@@ -22,6 +22,7 @@ IMPORTANT: Bot will not place any orders until you START it explicitly.
 from __future__ import annotations
 
 import asyncio
+import os
 import sys
 import time
 import traceback
@@ -46,6 +47,7 @@ from ui.dashboard import Dashboard
 from database.db import init_db, get_db
 from feeds.spread_scanner import SpreadScanner
 from notifier.telegram import TelegramNotifier
+from notifier.tg_bot import TelegramBot
 from strategies.cross_venue_carry import CrossVenueStrategy
 from venues.hyperliquid import HLClient
 from venues.lighter import LighterClient
@@ -131,6 +133,16 @@ async def carry_loop() -> None:
     scanner  = SpreadScanner(hl_client, lt_client)
     strategy = CrossVenueStrategy(hl_client, lt_client, scanner, stats, notifier)
 
+    # TG interactive bot (commands: /status /pos /spreads /history /help)
+    tg_bot = TelegramBot(
+        token=TELEGRAM_TOKEN, chat_id=TELEGRAM_CHAT_ID,
+        stats_ref=stats, positions_ref=strategy.positions,
+        scanner_ref=scanner,
+        db_path=os.getenv("DB_PATH", "database/carry.db"),
+        started_at=started_at,
+    )
+    _fire(tg_bot.run_forever(), "tg_bot")
+
     # Link dashboard to live state
     dash.stats     = stats
     dash.positions = strategy.positions
@@ -145,7 +157,12 @@ async def carry_loop() -> None:
     dash.opportunities = candidates
     dlog(f"Warm-up complete — {len(candidates)} spread opportunities found", "ok")
 
-    # ── Verify Lighter connectivity (read-only check) ─────────────────────────
+    # ── Verify balances (read-only check) ────────────────────────────────────
+    try:
+        dash.hl_balance = await hl_client.get_usdc_balance()
+        dlog(f"HL balance: ${dash.hl_balance:.2f} USDC (unified)", "ok")
+    except Exception as e:
+        dlog(f"HL balance check failed: {e}", "warn")
     try:
         lt_balance = await lt_client.get_available_balance()
         dash.lt_balance = lt_balance
@@ -255,6 +272,7 @@ async def carry_loop() -> None:
             # ── Refresh dashboard balances & opportunities ────────────────────
             if now - last_bal_check >= BAL_POLL:
                 try:
+                    dash.hl_balance    = await hl_client.get_usdc_balance()
                     dash.lt_balance    = await lt_client.get_available_balance()
                     dash.opportunities = scanner.ranked[:5]
                 except Exception:
