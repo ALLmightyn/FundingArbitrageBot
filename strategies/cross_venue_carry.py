@@ -336,18 +336,24 @@ class CrossVenueStrategy:
             )
             return
 
-        # 4. Anti-spike: reject if spread is far above its rolling mean (sigma filter).
-        # Funding spikes usually mean-revert within a few hours — entering at the peak
-        # locks you into fees with no expected funding income after the snap-back.
+        # 4. Anti-spike / warmup gate: reject if spread is far above its rolling mean,
+        # OR if scanner has not yet accumulated enough history to distinguish spike
+        # from normal rate. BLOCK on cold start (fail-closed) — entering a spike on
+        # startup is what caused NEAR entry at 0.091%/h that quickly normalized (BUG-022).
         try:
             is_spike, sigma_reason = self._scanner.is_spike(asset, snap)
             if is_spike:
-                log_warn(f"CrossVenue: {asset} SIGMA SPIKE — skipping ({sigma_reason})")
-                self._set_cooldown(asset)
+                if "warming_up" in sigma_reason:
+                    log(f"CrossVenue: {asset} spike filter warming up — skipping ({sigma_reason})")
+                else:
+                    log_warn(f"CrossVenue: {asset} SIGMA SPIKE — skipping ({sigma_reason})")
+                # No cooldown on warmup — try again next tick once more history exists
+                if "warming_up" not in sigma_reason:
+                    self._set_cooldown(asset)
                 return
         except Exception as e:
             crash_log(f"CrossVenue.sigma_check.{asset}", e)
-            # On error, do not block entry — fail open
+            return  # fail-closed on error: do not enter if spike check fails
 
         log(
             f"CrossVenue: entering {asset} | spread={snap.spread*100:.4f}%/h "

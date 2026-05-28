@@ -99,6 +99,13 @@ Format: **Error → Cause → Fix → File**
 - Fix: `CrossVenueStrategy.recover_open_positions()` — reads OPEN DB cycles, checks exchange (HL `get_perp_position_size` + Lighter `get_position_for_asset`), restores to HOLD or marks ABANDONED/partial-close. Called in `main_cross.py` after strategy init, before tick loop.
 - File: `strategies/cross_venue_carry.py:recover_open_positions`, `main_cross.py`
 
+**BUG-022** Bot entered NEAR at funding spike (0.091%/h shown as ~800% APR); real APR was ~108%
+- Symptom: Scanner consistently showed NEAR in top with ~800% APR. Entry at 23:05. First settlement (00:00) showed Lighter rate 0.0128%/h — rate had already normalized 7× within 1 hour.
+- Cause: `is_spike()` returned `(False, "insufficient_history")` on cold start (0 samples < SPIKE_HISTORY_MIN_SAMPLES=12). **Fail-open** on warmup allowed entry into what was a transient spike.
+- Reconstruction: spike required Lighter NEAR rate ~0.091%/h at entry. Normalized to 0.0128%/h by first settlement, 0.0119%/h by second.
+- Fix: Changed fail-open to **fail-closed** on warmup — `is_spike()` returns `(True, "warming_up (N/12)")` until 12 samples accumulated (~12 min). Strategy logs "warming up" without setting cooldown (retries every tick). Added `warmup_complete(asset)` helper.
+- File: `feeds/spread_scanner.py:is_spike`, `strategies/cross_venue_carry.py:_enter_position`
+
 **BUG-021** Lighter position + resting order remained after "successful" `_close_lt_leg(maker)` — bot believed leg closed, exchange disagreed
 - Symptom: cycle marked CLOSED in DB and Telegram; UI showed live Lighter short and open maker order
 - Cause: `maker_chase_entry` was reused for both entry and exit, but its fill check `size_on_exch >= size*0.9` is only valid for ENTRY. On exit, the existing position size already satisfies the threshold → function returns "FILLED" on first attempt while the order rests on book → orphan

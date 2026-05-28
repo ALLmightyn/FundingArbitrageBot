@@ -181,15 +181,25 @@ class SpreadScanner:
         excl = exclude or set()
         return [s for s in self.ranked if s.asset not in excl][:n]
 
+    def warmup_complete(self, asset: str) -> bool:
+        """True once we have enough spread history to run the spike filter reliably."""
+        hist = self._spread_history.get(asset)
+        return hist is not None and len(hist) >= SPIKE_HISTORY_MIN_SAMPLES
+
     def is_spike(self, asset: str, snap: SpreadSnapshot) -> Tuple[bool, str]:
         """
         Return (is_spike, reason). True if current signed spread exceeds
-        rolling_mean ± SPIKE_SIGMA_THRESHOLD * sigma. Returns False (allow entry)
-        if not enough history has accumulated yet — be optimistic on cold start.
+        rolling_mean ± SPIKE_SIGMA_THRESHOLD * sigma.
+
+        Returns (True, "warming_up") — BLOCK entry — if not enough history has
+        accumulated yet. The old fail-open behaviour was the root cause of the
+        NEAR funding-spike entry (BUG-022): bot entered at 0.091%/h Lighter rate
+        (800% APR display) because spike filter had 0 samples on cold start;
+        rate normalized to 0.013%/h within the first hour → real APR ~108%.
         """
         hist = self._spread_history.get(asset)
         if hist is None or len(hist) < SPIKE_HISTORY_MIN_SAMPLES:
-            return False, "insufficient_history"
+            return True, f"warming_up ({len(hist) if hist else 0}/{SPIKE_HISTORY_MIN_SAMPLES} samples)"
 
         # Use signed differential (hl - lt) — direction matters for spike detection
         current_signed = snap.hl_rate - snap.lighter_rate
