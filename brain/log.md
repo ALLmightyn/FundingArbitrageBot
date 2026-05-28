@@ -4,6 +4,12 @@
 
 ---
 
+## 2026-05-28
+
+`2026-05-28 15:35 | strategies/cross_venue_carry.py | BUGFIX BUG-020 — HL funding учитывался с обратным знаком в poll_hl_funding_rest. HL cumFunding.sinceOpen использует COST convention (positive = paid), а наш hl_funding_collected — P&L convention (positive = earned). Старый код: hl_funding_collected = since_open → знак инвертирован И WS-события (которые были корректные) перезаписывались. Подтверждение: NEAR Long, реальный userFunding usdc=-0.000307 (платили), но cumFunding.sinceOpen вернул бы +0.000307. Fix: earned_total = -since_open.`
+
+`2026-05-28 15:40 | venues/lighter.py + strategies/cross_venue_carry.py | BUGFIX BUG-021 — Lighter позиция и ордер оставались "живыми" после "успешного" close_lt_leg(maker). Root cause: maker_chase_entry проверял "filled?" через size_on_exch >= size*0.9 — на закрытии существующая позиция мгновенно удовлетворяет условие, функция возвращает order_id, бот считает что закрыл, реально ордер просто висит. Fix: (1) добавлены параметры closing+reduce_only в maker_chase_entry; (2) snapshot pre_size до первого размещения; (3) при closing — fill условие "closed_qty = pre_size - size_on_exch >= size*0.9"; (4) на timeout/exhaust — best-effort cleanup cancel; (5) в _close_lt_leg после успешного maker close — read-back verification и fallback на taker если remaining > 10%.`
+
 ## 2026-05-27
 
 `2026-05-27 23:50 | strategies/cross_venue_carry.py | ЧЕСТНЫЙ P&L — 3 улучшения точности учёта: (1) Lighter funding: заменён account-level collateral delta (сломан при >1 позиций) на rate×time×notional per position — _lt_last_funding_poll[asset] таймер, poll_lighter_funding теперь начисляет sign×rate×notional_usd×elapsed_hours независимо по каждому асету; (2) Фактическая цена входа HL: сразу после fill читаем entryPx из get_clearinghouse() (не mark_price) — логируем slippage%; (3) Фактическая цена входа Lighter: get_position_for_asset().entry_price после fill (не bid/ask mid) — логируем slippage%. Cleanup: _lt_last_funding_poll.pop + _lt_collateral_at_entry.pop при закрытии позиции.`

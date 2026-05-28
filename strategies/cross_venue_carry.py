@@ -680,9 +680,29 @@ class CrossVenueStrategy:
                     size=pos.units,
                     label="close_lt",
                     timeout_s=MAKER_CHASE_TIMEOUT_S,
+                    closing=True,
+                    reduce_only=True,
                 )
                 if order_id is None:
                     return await self._close_lt_leg(asset, pos, is_buy, use_taker=True)
+
+                # Post-close verification — confirm position actually went to ~0.
+                # Belt-and-suspenders against any future fill-detection regressions.
+                try:
+                    lt_pos_after = await self._lt.get_position_for_asset(asset)
+                    remaining = abs(float(
+                        (lt_pos_after or {}).get("size", 0)
+                        or (lt_pos_after or {}).get("base_amount", 0) or 0
+                    ))
+                except Exception:
+                    remaining = 0.0
+                if remaining > pos.units * 0.1:
+                    log_warn(
+                        f"CrossVenue: {asset} Lighter close reported success but "
+                        f"{remaining:.6f} still open — falling back to taker"
+                    )
+                    return await self._close_lt_leg(asset, pos, is_buy, use_taker=True)
+
                 pos.exit_fee_usd += 0.0  # Lighter 0% maker
                 return True
         except Exception as e:
@@ -849,6 +869,14 @@ class CrossVenueStrategy:
             return
 
         # ── HL: cumFunding.sinceOpen from clearinghouse REST ─────────────────
+        # CRITICAL SIGN CONVENTION:
+        #   HL cumFunding.sinceOpen   → COST convention: positive = funding PAID
+        #                                                 negative = funding EARNED
+        #   HL WS userFundings.usdc   → P&L convention:  positive = EARNED
+        #                                                 negative = PAID
+        # Our pos.hl_funding_collected stores P&L (positive = earned), so we must
+        # NEGATE sinceOpen when assigning. Previous version did `= since_open`
+        # which doubled the bug: wrong sign + double-count vs WS events.
         try:
             state = await self._hl.get_clearinghouse()
             for ap in state.get("assetPositions", []):
@@ -859,15 +887,15 @@ class CrossVenueStrategy:
                     continue
                 cum        = pos_data.get("cumFunding", {})
                 since_open = float(cum.get("sinceOpen", 0) or 0)
-                # sinceOpen is the absolute total since position opened — assign
-                # directly and compute delta so we don't double-add WS events.
-                delta = since_open - pos.hl_funding_collected
+                # Convert HL cost convention → our P&L convention by negating.
+                earned_total = -since_open
+                delta = earned_total - pos.hl_funding_collected
                 if abs(delta) > 0.000001:
-                    pos.hl_funding_collected = since_open
+                    pos.hl_funding_collected = earned_total
                     self._stats.total_funding_usd += delta
                     log(
-                        f"HLFunding[REST]: {asset} cumSinceOpen=${since_open:+.5f} "
-                        f"(delta=${delta:+.5f})"
+                        f"HLFunding[REST]: {asset} cumSinceOpen(cost)=${since_open:+.5f} "
+                        f"earned=${earned_total:+.5f} (delta=${delta:+.5f})"
                     )
                     await self._db_update_funding(pos)
         except Exception as e:

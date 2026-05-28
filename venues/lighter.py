@@ -470,6 +470,8 @@ class LighterClient:
         label: str = "",
         timeout_s: float = 30.0,
         max_reposts: int = 10,
+        closing: bool = False,
+        reduce_only: bool = False,
     ) -> Optional[str]:
         """
         Rest a post-only limit order at best bid/ask. If not filled after
@@ -477,16 +479,40 @@ class LighterClient:
         Returns client_order_index str on fill, or None if timed out.
 
         Lighter 0% fee means reposts are truly free — can chase aggressively.
+
+        closing=True   → we're CLOSING a position. Fill detection compares against
+                         the position size BEFORE this chase started, looking for a
+                         drop of >= 90% of `size`. The old logic (size_on_exch >=
+                         size*0.9) would always trigger immediately on close because
+                         the open position already satisfies the threshold, returning
+                         "FILLED" while leaving the close order resting → orphan.
+        reduce_only=True → passes reduce_only to place_maker. Safe to enable for
+                           closing orders so any unintended fill cannot flip the
+                           position direction.
         """
         await self._ensure_markets()
         start = time.monotonic()
         repost_delay = timeout_s / max(max_reposts, 1)
         label_str = f"[{label}] " if label else ""
 
+        # Snapshot size BEFORE we place anything — needed for close-fill detection.
+        try:
+            _pre_pos = await self.get_position_for_asset(asset)
+            pre_size = abs(float(
+                (_pre_pos or {}).get("size", 0) or (_pre_pos or {}).get("base_amount", 0) or 0
+            ))
+        except Exception:
+            pre_size = 0.0
+
         for attempt in range(max_reposts):
             elapsed = time.monotonic() - start
             if elapsed >= timeout_s:
                 log_warn(f"LighterClient.maker_chase: {label_str}{asset} timed out after {elapsed:.0f}s")
+                # Best-effort cancel of any remaining resting order before returning.
+                try:
+                    await self.cancel_order(asset, "timeout_cleanup")
+                except Exception:
+                    pass
                 return None
 
             bid, ask = await self.get_best_prices(asset)
@@ -496,7 +522,7 @@ class LighterClient:
                 continue
 
             price = ask if is_buy else bid
-            order_id = await self.place_maker(asset, is_buy, size, price)
+            order_id = await self.place_maker(asset, is_buy, size, price, reduce_only=reduce_only)
             if order_id is None:
                 log_warn(f"LighterClient.maker_chase: {label_str}{asset} place_maker failed (attempt {attempt+1})")
                 await asyncio.sleep(2.0)
@@ -510,9 +536,21 @@ class LighterClient:
             pos = await self.get_position_for_asset(asset)
             if pos is not None:
                 size_on_exch = abs(float(pos.get("size", 0) or pos.get("base_amount", 0)))
-                if size_on_exch >= size * 0.9:
-                    log(f"LighterClient.maker_chase: {label_str}{asset} FILLED @ {price}")
-                    return order_id
+                if closing:
+                    # Closing: pre_size should drop by at least 90% of intended close `size`
+                    closed_qty = pre_size - size_on_exch
+                    if closed_qty >= size * 0.9:
+                        log(
+                            f"LighterClient.maker_chase: {label_str}{asset} CLOSE FILLED @ {price} "
+                            f"(pre={pre_size:.6f} → now={size_on_exch:.6f}, closed={closed_qty:.6f})"
+                        )
+                        return order_id
+                else:
+                    # Opening: position size grows from 0 (or pre_size) to >= target
+                    grown = size_on_exch - pre_size
+                    if grown >= size * 0.9:
+                        log(f"LighterClient.maker_chase: {label_str}{asset} FILLED @ {price}")
+                        return order_id
 
             # Not filled → cancel and try again at new price.
             # IMPORTANT: if cancel fails, abort immediately — continuing would place
@@ -526,4 +564,9 @@ class LighterClient:
                 return None
 
         log_warn(f"LighterClient.maker_chase: {label_str}{asset} exhausted {max_reposts} reposts")
+        # Final cleanup cancel — make sure nothing lingers on the book.
+        try:
+            await self.cancel_order(asset, "exhausted_cleanup")
+        except Exception:
+            pass
         return None
