@@ -12,7 +12,24 @@ Updated: 2026-05-27
 | **HL-only carry** | `main.py` | Perp short + Spot long on Hyperliquid | HL only |
 | **Cross-venue arb** | `main_cross.py` | Perp short on high-rate venue + Perp long on low-rate venue | HL ↔ Lighter |
 
-**Cross-venue статус (2026-05-27):** Код готов. Ждёт: Lighter SDK install + USDC deposit на Lighter + API ключи в .env.
+**Cross-venue статус (2026-05-28):** 🟢 Live mainnet. Первый реальный цикл — NEAR short=Lighter long=HL, ~2h. Реальный APR подтверждён (см. ниже).
+
+## РЕАЛЬНЫЙ P&L АУДИТ — NEAR (2026-05-27 23:05 → 2026-05-28 ~01:10)
+
+| Нога | Выплата 00:00 | Выплата 01:00 | Итого |
+|---|---|---|---|
+| Lighter SHORT 9.4 NEAR | +$0.003210 | +$0.002925 | **+$0.006135** |
+| HL LONG 9.4 NEAR | −$0.000307 | −$0.000313 | **−$0.000620** |
+| **Net** | | | **+$0.005515** |
+
+```
+Notional = 9.4 NEAR × ~$2.38 ≈ $22.40/leg
+Net/h = $0.005515 / 2h = $0.002758/h
+Rate/h = $0.002758 / $22.40 = 0.01231%/h
+Реальный APR = 0.01231% × 8760 = ~108% годовых
+```
+
+**Дашборд показывал ~800% APR** — это топ-лист сканера (другие активы: SOL, ETH), НЕ спред конкретной NEAR позиции. NEAR при входе: Lighter 0.0128%/h − HL 0.00125%/h = спред ~0.01155%/h = 101% APR.
 
 **HL-only статус:** 🟢 mainnet, проверен, работал в мае 2026 (BTC carry).
 
