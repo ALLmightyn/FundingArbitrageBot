@@ -99,6 +99,19 @@ Format: **Error → Cause → Fix → File**
 - Fix: `CrossVenueStrategy.recover_open_positions()` — reads OPEN DB cycles, checks exchange (HL `get_perp_position_size` + Lighter `get_position_for_asset`), restores to HOLD or marks ABANDONED/partial-close. Called in `main_cross.py` after strategy init, before tick loop.
 - File: `strategies/cross_venue_carry.py:recover_open_positions`, `main_cross.py`
 
+**BUG-021** Lighter position + resting order remained after "successful" `_close_lt_leg(maker)` — bot believed leg closed, exchange disagreed
+- Symptom: cycle marked CLOSED in DB and Telegram; UI showed live Lighter short and open maker order
+- Cause: `maker_chase_entry` was reused for both entry and exit, but its fill check `size_on_exch >= size*0.9` is only valid for ENTRY. On exit, the existing position size already satisfies the threshold → function returns "FILLED" on first attempt while the order rests on book → orphan
+- Fix: (1) `closing=True` + `reduce_only=True` flags in `maker_chase_entry`; (2) snapshot `pre_size` before placing anything; (3) on closing path, require `closed_qty = pre_size - size_on_exch >= size*0.9`; (4) cleanup cancel on timeout/exhaust paths; (5) post-close read-back verification in `_close_lt_leg` with taker fallback if `remaining > units * 10%`
+- File: `venues/lighter.py:maker_chase_entry`, `strategies/cross_venue_carry.py:_close_lt_leg`
+
+**BUG-020** HL funding accounted with WRONG sign in `poll_lighter_funding` (REST path)
+- Symptom: For a NEAR Long paying funding (rate +0.00125%/h), bot booked `hl_funding_collected = +$0.0006` instead of `-$0.0006`
+- Cause: HL `cumFunding.sinceOpen` uses **cost convention** (positive = funding paid out); WS `userFundings.usdc` and our `hl_funding_collected` use **P&L convention** (positive = earned). Old code did `hl_funding_collected = since_open` — both flipped sign AND overwrote correct WS events
+- Verification: `info.post('/info', {'type':'userFunding'})` for our NEAR Long returned `usdc=-0.000307` (paid), confirming WS sign convention is P&L; `cumFunding.sinceOpen` would have been `+0.000307`
+- Fix: `earned_total = -since_open` before assigning
+- File: `strategies/cross_venue_carry.py:poll_lighter_funding`
+
 **BUG-018** `ArgumentError: argument 1: TypeError: 'NoneType' object cannot be interpreted as an integer` in `cancel_order`
 - Cause: `cancel_all_orders(time_in_force=None)` — the SDK's `sign_cancel_all_orders` passes the value directly to a ctypes C function `SignCancelAllOrders`, which requires an integer. `None` crashes ctypes at argument 1.
 - Fix: `time_in_force=self._signer.CANCEL_ALL_TIF_IMMEDIATE` (value `0`). Old comment claiming `None` was required was a server-error misread.
