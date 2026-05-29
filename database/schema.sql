@@ -104,6 +104,8 @@ CREATE TABLE IF NOT EXISTS cross_venue_cycles (
     exit_fee_usd            REAL DEFAULT 0,
     hl_funding_collected    REAL DEFAULT 0,
     lighter_funding_collected REAL DEFAULT 0,
+    lighter_last_funding_id  INTEGER DEFAULT 0,
+    hl_last_funding_time_ms  INTEGER DEFAULT 0,
     net_pnl_usd             REAL DEFAULT 0,
     exit_reason             TEXT
 );

@@ -185,6 +185,17 @@ class CrossVenuePosition:
     entry_fee_usd: float = 0.0
     exit_fee_usd: float = 0.0
 
+    # Highest Lighter funding_id we've already credited to lighter_funding_collected.
+    # Used for idempotency: positionFunding API returns ALL historical fundings,
+    # we only credit deltas with funding_id > this value. Survives restarts —
+    # next recovery call sets this to max seen, so re-poll cannot double-count.
+    lighter_last_funding_id: int = 0
+
+    # Timestamp (ms) of the last HL userFunding event credited to hl_funding_collected.
+    # Idempotency anchor for HL funding: only credit events with time_ms > this.
+    # Initialised to entered_at*1000 on new entry so we don't pick up pre-entry events.
+    hl_last_funding_time_ms: int = 0
+
     # Order IDs
     hl_order_id: Optional[str] = None
     lighter_order_id: Optional[str] = None

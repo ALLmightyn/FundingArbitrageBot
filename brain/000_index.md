@@ -1,6 +1,6 @@
 ---
 Type: MOC
-Updated: 2026-05-27
+Updated: 2026-05-30
 ---
 
 # 000 — Root MOC: HLCarryBot
@@ -9,130 +9,103 @@ Updated: 2026-05-27
 
 | Mode | Entry point | Strategy | Venues |
 |------|-------------|----------|--------|
-| **HL-only carry** | `main.py` | Perp short + Spot long on Hyperliquid | HL only |
-| **Cross-venue arb** | `main_cross.py` | Perp short on high-rate venue + Perp long on low-rate venue | HL ↔ Lighter |
+| **HL-only carry** | `main.py` | Perp short + Spot long на Hyperliquid | HL only |
+| **Cross-venue arb** | `main_cross.py` | Perp short на high-rate + Perp long на low-rate | HL ↔ Lighter |
 
-**Cross-venue статус (2026-05-28):** 🟢 Live mainnet. Первый реальный цикл — NEAR short=Lighter long=HL, ~2h. Реальный APR подтверждён (см. ниже).
-
-## РЕАЛЬНЫЙ P&L АУДИТ — NEAR (2026-05-27 23:05 → 2026-05-28 ~01:10)
-
-| Нога | Выплата 00:00 | Выплата 01:00 | Итого |
-|---|---|---|---|
-| Lighter SHORT 9.4 NEAR | +$0.003210 | +$0.002925 | **+$0.006135** |
-| HL LONG 9.4 NEAR | −$0.000307 | −$0.000313 | **−$0.000620** |
-| **Net** | | | **+$0.005515** |
-
-```
-Notional = 9.4 NEAR × ~$2.38 ≈ $22.40/leg
-Net/h = $0.005515 / 2h = $0.002758/h
-Rate/h = $0.002758 / $22.40 = 0.01231%/h
-Реальный APR = 0.01231% × 8760 = ~108% годовых
-```
-
-**Дашборд показывал ~800% APR** — это топ-лист сканера (другие активы: SOL, ETH), НЕ спред конкретной NEAR позиции. NEAR при входе: Lighter 0.0128%/h − HL 0.00125%/h = спред ~0.01155%/h = 101% APR.
-
-**HL-only статус:** 🟢 mainnet, проверен, работал в мае 2026 (BTC carry).
+**Cross-venue статус (2026-05-30):** 🟢 Live mainnet. Тестовый режим $25/leg. Накоплено 2 успешных закрытых цикла.
 
 ---
 
-## LIVE STATE (sync with core/constants.py after every param change)
-
-| Param | Value |
-|---|---|
-| POSITION_SIZE_USD | $300/leg |
-| MAX_POSITIONS | 3 |
-| PERP_LEVERAGE | 3× |
-| FUNDING_ENTRY_THRESHOLD | 0.00025 (0.025%/h) |
-| FUNDING_EXIT_SOFT | 0.0001 (0.01%/h) |
-| FUNDING_EXIT_FLIP | 0.0 |
-| MIN_HOLD_HOURS | 8h |
-| MAX_HOLD_HOURS | 48h |
-| MAKER_CHASE_TIMEOUT_S | 30s |
-| SPOT_TAKER_FALLBACK_S | 20s |
-| EXIT_COOLDOWN_SECONDS | 300s |
-| Network | **MAINNET** (HL_TESTNET=false) |
-
----
-
-## DATABASE SCHEMA
-
-```sql
--- funding_cycles
-id TEXT PK, asset, state, entered_at INT, exited_at INT, hold_hours REAL,
-spot_size_usd REAL, perp_size_usd REAL, perp_leverage INT,
-spot_entry REAL, perp_entry REAL, entry_funding_rate REAL,
-funding_collected REAL=0, fee_paid REAL=0, net_pnl REAL=0, exit_reason TEXT
-
--- funding_payments  [UNIQUE INDEX: (asset, paid_at)]
-id INT PK AUTOINCREMENT, cycle_id TEXT, asset, paid_at INT(ms), amount_usd REAL, funding_rate_1h REAL
-
--- legging_events
-id INT PK AUTOINCREMENT, asset, occurred_at INT, leg_filled TEXT, cover_action TEXT, cover_cost_usd REAL, cycle_id TEXT
-
--- deleverage_events
-id INT PK AUTOINCREMENT, asset, occurred_at INT, trigger TEXT, margin_ratio REAL, size_before_usd REAL, size_after_usd REAL, cycle_id TEXT
-
--- kill_switch_log
-id INT PK AUTOINCREMENT, triggered_at INT, trigger_reason TEXT, assets_affected TEXT, resume_at INT
-
--- sessions
-id TEXT PK, started_at INT, ended_at INT, starting_nav REAL, ending_nav REAL,
-total_cycles INT, total_funding_usd REAL, total_fees_usd REAL, net_pnl REAL
-```
-
----
-
-## CROSS-VENUE CONSTANTS (core/constants.py — обновлено 2026-05-27)
+## LIVE STATE (sync с core/constants.py после каждого изменения параметра)
 
 | Параметр | Значение | Смысл |
-|----------|----------|-------|
-| SPREAD_ENTRY_THRESHOLD | 0.00030 (0.030%/h) | Мин. спред для входа (включает slippage буфер) |
-| SPREAD_EXIT_THRESHOLD | 0.00010 (0.010%/h) | Soft exit |
-| SPREAD_EXIT_FLIP | -0.00005 (-0.005%/h) | Hard exit (taker) |
-| CROSS_POSITION_SIZE_USD | $300/leg | Per-leg notional |
-| CROSS_MAX_POSITIONS | 2 | Макс. одновременных пар |
-| CROSS_MIN_HOLD_HOURS | 4h | Минимальное время |
-| CROSS_MAX_HOLD_HOURS | 48h | Максимальное время |
-| MAX_LIGHTER_BOOK_SPREAD_PCT | 0.3% | Отклонить вход если Lighter стакан шире |
-| MIN_LIGHTER_FREE_BALANCE_USD | $150 | Минимум свободных средств на Lighter |
-| FEE_CROSS_TOTAL_ESTIMATE | 0.050% | Worst-case round-trip (HL maker ×2 + slippage) |
-| CROSS_VENUE_WHITELIST | 29 assets | BTC, ETH, SOL, BNB, XRP... (только ликвидные) |
+|---|---|---|
+| CROSS_POSITION_SIZE_USD | **$25/leg** | TEST MODE — поднять до $500+ после 3-5 чистых циклов |
+| CROSS_MAX_POSITIONS | 1 | строго 1 монета одновременно |
+| CROSS_MIN_HOLD_HOURS | 8h | минимум перед soft-exit |
+| CROSS_MAX_HOLD_HOURS | 48h | максимум |
+| CROSS_EXIT_COOLDOWN_S | 900s | 15 мин пауза после выхода |
+| SPREAD_ENTRY_THRESHOLD | 0.00005 (0.005%/h, ~44% APR) | минимальный исторический спред для входа |
+| SPREAD_EXIT_THRESHOLD | 0.00002 (0.002%/h) | soft-exit (maker) |
+| SPREAD_EXIT_FLIP | -0.00002 | hard-exit (taker) при флипе |
+| SPREAD_TWAP_WINDOW_S | 1800s (30 мин) | окно TWAP gate |
+| SPREAD_TWAP_MIN_SAMPLES | 20 | ~10 мин прогрева (fail-closed) |
+| STABILITY_LOOKBACK_HOURS | 24 | часов истории HL settlements |
+| STABILITY_MIN_HIT_RATIO | 0.25 | 25% часов выше threshold (было 0.50 — захардкожено, исправлено) |
+| MAKER_CHASE_TIMEOUT_S | 30s | таймаут cover-leg / выхода |
+| LT_ENTRY_TIMEOUT_S | 90s | таймаут Lighter entry leg (дольше — HL захеджирован) |
+| CROSS_VENUE_WHITELIST | 21 tier-1 активов | BTC ETH SOL BNB XRP DOGE ADA AVAX LINK DOT AAVE BCH LTC ATOM UNI SUI ARB OP APT TAO NEAR |
+| Network | **MAINNET** | HL_TESTNET=false |
 
-## CROSS-VENUE DB (database/schema.sql)
+---
+
+## DATABASE SCHEMA (cross_venue_cycles)
 
 ```sql
 cross_venue_cycles:
-  id TEXT PK, asset, state, short_venue, long_venue,
-  entered_at INT, exited_at INT, notional_usd, units,
-  hl_entry_price, lighter_entry_price,
-  hl_rate_at_entry, lighter_rate_at_entry, spread_at_entry,
-  entry_fee_usd, exit_fee_usd,
-  hl_funding_collected, lighter_funding_collected,
-  net_pnl_usd, exit_reason
+  id TEXT PK, asset, state TEXT (OPEN/CLOSED/ABANDONED),
+  short_venue TEXT, long_venue TEXT,
+  entered_at INT, exited_at INT,
+  notional_usd REAL, units REAL,
+  hl_entry_price REAL, lighter_entry_price REAL,
+  hl_rate_at_entry REAL, lighter_rate_at_entry REAL, spread_at_entry REAL,
+  entry_fee_usd REAL, exit_fee_usd REAL,
+  hl_funding_collected REAL,         -- реальные USD (userFunding API, с BUG-038 фиксом)
+  lighter_funding_collected REAL,    -- реальные USD (positionFunding API)
+  lighter_last_funding_id INT,       -- idempotency anchor для Lighter (funding_id)
+  hl_last_funding_time_ms INT,       -- idempotency anchor для HL (timestamp ms)
+  net_pnl_usd REAL,
+  exit_reason TEXT
 ```
 
-## CROSS-VENUE SETUP CHECKLIST
+**Полезные запросы:**
+```bash
+# Последние циклы с P&L
+sqlite3 database/carry.db "SELECT asset, state, round((exited_at-entered_at)/3600.0,1) AS hold_h, round(hl_funding_collected+lighter_funding_collected,5) AS fund, round(net_pnl_usd,5) AS net, exit_reason FROM cross_venue_cycles ORDER BY entered_at DESC LIMIT 8;"
 
-1. `uv pip install git+https://github.com/elliottech/zklighter-perps-python.git`
-2. Deposit USDC on Lighter (via Arbitrum). Recommended ≥$500.
-3. lighter.xyz → Settings → API Keys → Create (get index + private key)
-4. Fill .env: LIGHTER_L1_ADDRESS, LIGHTER_ACCOUNT_INDEX=0, LIGHTER_API_KEY_INDEX, LIGHTER_API_PRIVATE_KEY
-5. `python _scan_now.py` — verify live opportunities
-6. `python main_cross.py`
+# Текущая открытая позиция
+sqlite3 database/carry.db "SELECT asset, round((strftime('%s','now')-entered_at)/3600.0,1) AS hold_h, round(hl_funding_collected,5) AS hl_f, round(lighter_funding_collected,5) AS lt_f, round(entry_fee_usd,4) AS fee FROM cross_venue_cycles WHERE state='OPEN';"
+```
+
+---
+
+## АРХИТЕКТУРА FUNDING TRACKING (актуально после 2026-05-30)
+
+**HL:** `userFunding` REST endpoint → реальные USD суммы, idempotent по `hl_last_funding_time_ms`.
+Заменил `cumFunding.sinceOpen` (сбрасывался при каждом закрытии ноги — BUG-038).
+
+**Lighter:** `positionFunding` authenticated API → реальные USD суммы, idempotent по `lighter_last_funding_id`.
+Заменил rate×time (завышал в 3.3× — BUG-034).
+
+---
+
+## ENTRY / EXIT LOGIC
+
+### Вход (Perp-First, BUG-036 исправлен)
+1. SpreadScanner: исторический score (avg_spread × hit_ratio, 24h) → ranked list
+2. Spike filter: 5 семплов warmup, σ-gate 2.5σ
+3. TWAP gate: 20 семплов / 30 мин — fail-closed
+4. HL leg: maker_chase_entry → при таймауте taker fallback (HL IOC)
+5. Lighter leg: maker_chase_entry @ **bid if buy / ask if sell** (BUG-036 был: инверсия → POST_ONLY реджект → ghost)
+6. Таймаут Lighter: 90s (3 подряд провала любой ноги → 4ч blacklist через `_entry_fail_streak`)
+
+### Выход
+- `spread_flip` (TWAP ≤ EXIT_FLIP): **taker** немедленно
+- `spread_soft_exit` (TWAP ≤ EXIT_THRESHOLD, hold ≥ 8h): **maker**
+- `max_hold` (48h): **maker**
+
+---
+
+## KNOWN LIMITATIONS / WATCH LIST
+
+- **BCH** — единственный стабильный кандидат сейчас (hits=13-21/24). Остальные активы: исторический спред ≤ EXIT_THRESHOLD после вычета Lighter ставки.
+- **APR нестабилен по времени суток:** ночью (азиатская/европейская сессия) ~100% APR gross, днём ~10-25%. Средний реальный ~30-50%.
+- **Масштаб:** при $2000 капитала ($1000/биржа) + плечо 2-3× → позиция $2000-3000 → ~100% net APR на капитал.
+
+---
 
 ## LINKS
 
 - [HL API & Fee Specs](hyperliquid_specs.md)
-- [Active Constants & State Machine](current_strategy.md)
-- [Bug Graveyard](bugs_and_fixes.md) ← read before touching any order/entry/exit code
+- [Bug Graveyard](bugs_and_fixes.md) ← читать перед правкой order/entry/exit кода
 - [Change Diary](log.md)
-
----
-
-## AUDIT QUERIES
-
-```bash
-sqlite3 database/carry.db "SELECT asset, state, net_pnl, exit_reason FROM funding_cycles ORDER BY entered_at DESC LIMIT 10;"
-sqlite3 database/carry.db "SELECT asset, amount_usd, funding_rate_1h FROM funding_payments ORDER BY paid_at DESC LIMIT 10;"
-sqlite3 database/carry.db "SELECT asset, leg_filled, cover_cost_usd FROM legging_events ORDER BY occurred_at DESC LIMIT 5;"
-```

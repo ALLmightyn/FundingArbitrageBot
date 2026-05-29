@@ -16,6 +16,7 @@ rendering, then push log lines with dashboard.log(msg, level).
 """
 from __future__ import annotations
 
+import sys
 import time
 from collections import deque
 from datetime import datetime, timedelta
@@ -26,6 +27,7 @@ from rich.console import Console, Group
 from rich.layout import Layout
 from rich.live import Live
 from rich.panel import Panel
+from rich.rule import Rule
 from rich.table import Table
 from rich.text import Text
 from rich import box
@@ -56,7 +58,10 @@ class Dashboard:
     """
 
     def __init__(self) -> None:
+        self._is_tty       = sys.stdout.isatty()
         self._console      = Console()
+        # Headless console: force ANSI output even to a file so pm2 logs renders colors
+        self._headless_console = Console(force_terminal=True, width=120, highlight=False)
         self._live: Optional[Live] = None
         self._started_at   = int(time.time())
         self._log_lines: Deque[Tuple[str, str, str]] = deque(maxlen=_MAX_LOG_LINES)
@@ -65,6 +70,7 @@ class Dashboard:
         self.stats        = None   # SessionStats
         self.positions    = {}     # Dict[str, CrossVenuePosition]
         self.opportunities: List  = []   # List[SpreadSnapshot] from scanner
+        self.scanner      = None   # SpreadScanner — for live TWAP lookup
         self.hl_balance   = 0.0
         self.lt_balance   = 0.0
         self.portfolio_killed = False
@@ -73,7 +79,10 @@ class Dashboard:
     # ── Public API ────────────────────────────────────────────────────────────
 
     def start_live(self) -> "Dashboard":
-        """Start Rich Live context. Call once at bot startup."""
+        """Start Rich Live context (TTY only). Under pm2/headless, snapshot printing is
+        used instead — call print_snapshot() periodically from the tick loop."""
+        if not self._is_tty:
+            return self  # headless mode: no Live, snapshots printed on schedule
         self._live = Live(
             self._render(),
             console=self._console,
@@ -82,6 +91,17 @@ class Dashboard:
         )
         self._live.start()
         return self
+
+    def print_snapshot(self) -> None:
+        """Print a full-panel status snapshot to stdout. Used in headless/pm2 mode
+        instead of Live so the table appears in pm2 logs as ANSI-rendered text."""
+        c = self._headless_console
+        c.print(Rule(f"[bold white]⚡ FundingArbitrageBot snapshot — {datetime.now().strftime('%H:%M:%S')}[/]",
+                     style="bright_blue"))
+        c.print(self._render_header())
+        c.print(self._render_positions())
+        c.print(self._render_opportunities())
+        c.print(Rule(style="dim"))
 
     def stop(self) -> None:
         if self._live:
@@ -173,7 +193,7 @@ class Dashboard:
         table.add_column("Short→Long",  style="dim",            width=15)
         table.add_column("Size USD",    justify="right",        width=9)
         table.add_column("Hold",        justify="right",        width=7)
-        table.add_column("Entry spr.",  justify="right",        width=11)
+        table.add_column("Entry/TWAP",  justify="right",        width=18)
         table.add_column("Funding",     justify="right",        width=10)
         table.add_column("Fees",        justify="right",        width=8)
         table.add_column("Net P&L",     justify="right",        width=10)
@@ -201,13 +221,26 @@ class Dashboard:
                 net_style = "bright_green" if net >= 0 else "bright_red"
                 fund_style = "bright_green" if pos.net_funding_usd >= 0 else "bright_red"
 
+                # Show entry spread + current TWAP — the TWAP is what the exchange
+                # actually credits each hour. If TWAP << entry, the position is a
+                # losing carry now (instant rate may still look high but won't settle).
+                twap_str = ""
+                if self.scanner is not None:
+                    try:
+                        twap_abs, twap_valid = self.scanner.get_twap_spread(asset)
+                        if twap_valid:
+                            twap_str = f" → {twap_abs*100:.4f}"
+                    except Exception:
+                        pass
+                spread_cell = f"{pos.spread_at_entry*100:.4f}{twap_str}%/h"
+
                 table.add_row(
                     asset,
                     Text(str(pos.state.value), style=state_style),
                     f"{pos.short_venue}→{pos.long_venue}",
                     f"${pos.notional_usd:.0f}",
                     hold_str,
-                    f"{pos.spread_at_entry*100:.4f}%/h",
+                    spread_cell,
                     Text(f"${pos.net_funding_usd:+.4f}", style=fund_style),
                     f"${pos.entry_fee_usd + pos.exit_fee_usd:.4f}",
                     Text(f"${net:+.4f}", style=net_style + " bold"),

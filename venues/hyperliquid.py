@@ -24,6 +24,7 @@ from hyperliquid.utils import constants as hl_constants
 from core.constants import (
     HL_REST_URL, HL_TESTNET_REST_URL, HL_WS_URL, HL_TESTNET_WS_URL,
     MAKER_CHASE_MAX_REPOSTS, MAKER_CHASE_REPOST_DELAY_S, MAKER_CHASE_TIMEOUT_S,
+    LIGHTER_TO_HL_SYMBOL, HL_TO_LIGHTER_SYMBOL,
 )
 from core.logger import log, log_warn, log_err, crash_log
 
@@ -59,18 +60,26 @@ class HLClient:
 
     # ── Helpers ───────────────────────────────────────────────────────────────
 
+    @staticmethod
+    def _hl(asset: str) -> str:
+        """Translate Lighter canonical name → HL exchange name (e.g. 1000PEPE → kPEPE)."""
+        return LIGHTER_TO_HL_SYMBOL.get(asset, asset)
+
     async def _run(self, fn: Callable, *args, **kwargs) -> Any:
         """Run a synchronous SDK call in the executor without blocking the loop."""
         loop = asyncio.get_event_loop()
         return await loop.run_in_executor(None, lambda: fn(*args, **kwargs))
 
     async def _get_sz_decimals(self, asset: str) -> int:
-        """Return szDecimals for asset (cached). Used to round order sizes correctly."""
-        if asset not in self._sz_decimals:
+        """Return szDecimals for asset (cached). Translates Lighter canonical → HL name
+        before lookup so that e.g. 1000PEPE correctly resolves to kPEPE's decimals (0),
+        not the fallback 4 which causes 'Order has invalid size' errors."""
+        hl_name = self._hl(asset)  # 1000PEPE → kPEPE, others pass through unchanged
+        if hl_name not in self._sz_decimals:
             meta = await self.get_meta()
             for u in meta.get("universe", []):
                 self._sz_decimals[u["name"]] = int(u.get("szDecimals", 4))
-        return self._sz_decimals.get(asset, 4)
+        return self._sz_decimals.get(hl_name, 4)
 
     async def round_size(self, asset: str, size: float) -> float:
         """Round size to the asset's szDecimals to avoid float_to_wire errors."""
@@ -150,10 +159,11 @@ class HLClient:
 
     async def get_perp_position_size(self, asset: str) -> float:
         """Return absolute size of current perp position for asset (0.0 if flat)."""
+        hl_asset = self._hl(asset)
         ch = await self.get_clearinghouse()
         for ap in ch.get("assetPositions", []):
             p = ap.get("position", {})
-            if p.get("coin") == asset:
+            if p.get("coin") == hl_asset:
                 return abs(float(p.get("szi", 0) or 0))
         return 0.0
 
@@ -220,8 +230,13 @@ class HLClient:
             oracle = _f(ctx.get("oraclePx"))
             if mark == 0.0 and oracle == 0.0:
                 continue  # skip delisted / inactive assets
+            # Keep SDK's name_to_coin in sync with fresh universe (BUG-025).
+            if asset not in self._info.name_to_coin:
+                self._info.name_to_coin[asset] = asset
+            # Normalize HL name → Lighter canonical name (kPEPE → 1000PEPE)
+            canonical = HL_TO_LIGHTER_SYMBOL.get(asset, asset)
             result.append({
-                "asset":        asset,
+                "asset":        canonical,
                 "funding":      _f(ctx.get("funding")),
                 "openInterest": _f(ctx.get("openInterest")),
                 "markPx":       mark,
@@ -229,6 +244,57 @@ class HLClient:
                 "premium":      _f(ctx.get("premium")),
             })
         return result
+
+    async def get_funding_history(self, asset: str, hours: int = 24) -> List[Dict]:
+        """
+        Return HL funding settlement history for asset.
+        Each entry: {coin, fundingRate, premium, time (ms)}.
+        Sorted by time ascending. fundingRate is the actual TWAP settlement rate.
+
+        Used by SpreadScanner.is_stable_carry to filter spike entries: a 200%/h
+        instant rate that has never settled at that level historically is a trap.
+        """
+        try:
+            import time as _t
+            start_ms = int((_t.time() - hours * 3600) * 1000)
+            hl_asset = self._hl(asset)
+            result = await self._run(
+                self._info.post, "/info",
+                {"type": "fundingHistory", "coin": hl_asset, "startTime": start_ms},
+            )
+            return result if isinstance(result, list) else []
+        except Exception as e:
+            crash_log(f"HLClient.get_funding_history.{asset}", e)
+            return []
+
+    async def get_user_funding_history(self, asset: str, since_ms: int) -> List[Dict]:
+        """Return actual user funding payments for asset since since_ms.
+        Uses userFunding endpoint — returns real settled USD amounts, not rates.
+        Each entry: {time_ms, usdc (positive=earned/negative=paid), rate, szi}.
+        Sorted ascending by time. Filters to the requested asset only.
+        """
+        try:
+            hl_asset = self._hl(asset)
+            result = await self._run(
+                self._info.post, "/info",
+                {"type": "userFunding", "user": self._address, "startTime": since_ms},
+            )
+            entries = []
+            for entry in (result or []):
+                delta = entry.get("delta", {})
+                if delta.get("coin") != hl_asset:
+                    continue
+                entries.append({
+                    "time_ms": int(entry["time"]),
+                    "usdc":    float(delta.get("usdc", 0) or 0),
+                    "rate":    float(delta.get("fundingRate", 0) or 0),
+                    "szi":     float(delta.get("szi", 0) or 0),
+                })
+            entries.sort(key=lambda x: x["time_ms"])
+            return entries
+        except Exception as e:
+            crash_log(f"HLClient.get_user_funding_history.{asset}", e)
+            return []
 
     async def get_predicted_fundings(self) -> List[Dict]:
         """
@@ -243,8 +309,22 @@ class HLClient:
             return []
 
     async def get_l2_book(self, asset: str) -> Dict:
-        """Return L2 orderbook snapshot for a perp asset."""
-        return await self._run(self._info.l2_snapshot, asset)
+        """Return L2 orderbook snapshot for a perp asset. Never returns None."""
+        _empty = {"levels": [[], []]}
+        hl_asset = self._hl(asset)
+        try:
+            result = await self._run(self._info.l2_snapshot, hl_asset)
+            return result if result is not None else _empty
+        except KeyError:
+            # Asset listed after SDK init — name_to_coin stale; post directly (BUG-025)
+            self._info.name_to_coin[hl_asset] = hl_asset
+            try:
+                result = await self._run(self._info.post, "/info", {"type": "l2Book", "coin": hl_asset})
+                return result if result is not None else _empty
+            except Exception:
+                return _empty
+        except Exception:
+            return _empty
 
     # ── Order placement ───────────────────────────────────────────────────────
 
@@ -265,7 +345,7 @@ class HLClient:
         order_type = {"limit": {"tif": "Alo"}}
         ro = False if is_spot else reduce_only
         return await self._run(
-            self._exchange.order, asset, is_buy, size, price, order_type, reduce_only=ro,
+            self._exchange.order, self._hl(asset), is_buy, size, price, order_type, reduce_only=ro,
         )
 
     async def place_taker(
@@ -282,17 +362,18 @@ class HLClient:
         order_type = {"limit": {"tif": "Ioc"}}
         ro = False if is_spot else reduce_only
         return await self._run(
-            self._exchange.order, asset, is_buy, size, price, order_type, reduce_only=ro,
+            self._exchange.order, self._hl(asset), is_buy, size, price, order_type, reduce_only=ro,
         )
 
     async def cancel_order(self, asset: str, order_id: int) -> Dict:
-        return await self._run(self._exchange.cancel, asset, order_id)
+        return await self._run(self._exchange.cancel, self._hl(asset), order_id)
 
     async def cancel_all(self, asset: str) -> None:
         """Cancel all open orders on a given asset."""
         try:
+            hl_asset = self._hl(asset)
             open_orders = await self.get_open_orders()
-            to_cancel = [o for o in open_orders if o.get("coin") == asset]
+            to_cancel = [o for o in open_orders if o.get("coin") == hl_asset]
             for o in to_cancel:
                 await self.cancel_order(asset, o["oid"])
         except Exception as e:
@@ -337,6 +418,8 @@ class HLClient:
         order_id: Optional[str] = None
         last_price: Optional[float] = None
         reposts = 0
+        consecutive_errors = 0   # "immediately matched" streak counter
+        consecutive_empty = 0    # empty book streak counter
 
         # Snapshot position size before entering chase — used to detect phantom fills after cancel.
         # Skipped for spot (requires separate balance query, less critical due to taker fallback).
@@ -350,21 +433,30 @@ class HLClient:
         while time.time() < deadline and reposts <= MAKER_CHASE_MAX_REPOSTS:
             # Get current touch price
             book = await self.get_l2_book(asset)
-            levels = book.get("levels", [[], []])
+            levels = (book or {}).get("levels", [[], []])
             bid_levels, ask_levels = levels[0], levels[1]
 
             if is_buy:
                 if not bid_levels:
-                    log_warn(f"MakerChase {label}: empty bid side, waiting...")
+                    consecutive_empty += 1
+                    if consecutive_empty >= 3:
+                        log_warn(f"MakerChase {label}: empty bid side 3× in a row — aborting")
+                        return None
+                    log_warn(f"MakerChase {label}: empty bid side ({consecutive_empty}/3), waiting...")
                     await asyncio.sleep(MAKER_CHASE_REPOST_DELAY_S)
                     continue
                 touch_price = float(bid_levels[0]["px"])
             else:
                 if not ask_levels:
-                    log_warn(f"MakerChase {label}: empty ask side, waiting...")
+                    consecutive_empty += 1
+                    if consecutive_empty >= 3:
+                        log_warn(f"MakerChase {label}: empty ask side 3× in a row — aborting")
+                        return None
+                    log_warn(f"MakerChase {label}: empty ask side ({consecutive_empty}/3), waiting...")
                     await asyncio.sleep(MAKER_CHASE_REPOST_DELAY_S)
                     continue
                 touch_price = float(ask_levels[0]["px"])
+            consecutive_empty = 0  # reset on successful book read
 
             # Repost if price moved or first placement
             if order_id is not None and last_price is not None:
@@ -412,12 +504,21 @@ class HLClient:
                 if "resting" in status:
                     order_id = str(status["resting"]["oid"])
                     last_price = touch_price
+                    consecutive_errors = 0  # reset on successful resting
                     log(f"MakerChase {label}: resting @ {touch_price:.4f} oid={order_id}")
                 elif "filled" in status:
                     log(f"MakerChase {label}: instant fill @ {touch_price:.4f}")
                     return str(status["filled"]["oid"])
                 elif "error" in status:
-                    log_warn(f"MakerChase {label}: order error: {status['error']}")
+                    err_msg = status["error"]
+                    if "immediately matched" in err_msg:
+                        consecutive_errors += 1
+                        if consecutive_errors >= 3:
+                            log_warn(f"MakerChase {label}: 'immediately matched' 3× — market too fast for maker, aborting")
+                            return None
+                        log_warn(f"MakerChase {label}: order error ({consecutive_errors}/3): {err_msg}")
+                    else:
+                        log_warn(f"MakerChase {label}: order error: {err_msg}")
                     await asyncio.sleep(MAKER_CHASE_REPOST_DELAY_S)
                     continue
             except Exception as e:

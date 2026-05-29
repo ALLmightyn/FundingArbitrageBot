@@ -94,6 +94,49 @@ Format: **Error → Cause → Fix → File**
 - Fix: 3-layer dedup: (1) in-memory `_seen_fundings` set by `(asset, paid_at_ms)`; (2) `UNIQUE INDEX uq_payments_asset_time` + `INSERT OR IGNORE`; (3) temporal guard — ignore events where `paid_at < pos.entered_at * 1000`
 - File: `strategies/funding_carry.py`, `schema.sql`
 
+**BUG-034** Lighter funding accounting завышал в ~3.3× (rate×time vs real settlements)
+- Symptom: NEAR 2h позиция — бот показал Lighter funding $+0.0051; реально биржа кредитнула $+0.001529. APR заявлен 507%, реальный ~16%.
+- Cause: `poll_lighter_funding` использовал `instant_rate × elapsed × notional`. instant_rate из /funding-rates это predicted (current premium/8), не settlement. Settlement = TWAP 60 минутных премиумов за час. Instant ~3× больше TWAP при stable rate, ~10-35× при spikes.
+- Fix: новый `LighterClient.get_position_fundings(asset, since_ts)` — реальные settled events через authenticated `/positionFunding` API (lighter.AccountApi). poll_lighter_funding теперь читает реальные суммы. Idempotency: `pos.lighter_last_funding_id` хранит max обработанный funding_id, фильтр `fid > last_seen` гарантирует no double-credit. DB: новая колонка `lighter_last_funding_id`.
+- Recovery safety: при recover_open_positions если `lighter_last_funding_id==0 && lighter_funding_collected!=0` — данные из старого rate×time, сбрасываем и перенабираем через API (одноразово после миграции).
+- Files: `venues/lighter.py:get_position_fundings`, `strategies/cross_venue_carry.py:poll_lighter_funding/recover_open_positions`, `core/models.py`, `database/schema.sql`
+
+**BUG-035** Exit logic сравнивает instant spread (а не TWAP) → ложные удержания при spike
+- Symptom: позиция NEAR держалась несмотря на реальный спред 0.001%/h (settlement TWAP) — бот видел instant 0.05%/h (spike) и SOFT_EXIT не срабатывал.
+- Cause: `_manage_hold` использовал `snap.spread` (instant). Exit thresholds сравнивались с зашумлённым значением — то срабатывали на ложный спайк вниз, то наоборот не срабатывали при реально низком settlement.
+- Fix: используем `scanner.get_twap_spread()` для exit decisions. instant остается для информации в логах. Fallback на instant если TWAP не валиден (warmup).
+- File: `strategies/cross_venue_carry.py:_manage_hold`
+
+**BUG-033** 1000PEPE "Order has invalid size" на HL
+- Symptom: все 10 попыток HL maker для 1000PEPE → "Order has invalid size", entry abort
+- Cause: `_get_sz_decimals(asset)` кэш заполняется HL именами (`kPEPE`), но вызов приходит с Lighter canonical (`1000PEPE`). `_sz_decimals.get("1000PEPE", 4)` → fallback 4 decimal places. kPEPE на HL имеет szDecimals=0. Размер `2083.3333` с 4 знаками → HL reject.
+- Fix: `_get_sz_decimals` теперь переводит `asset` через `self._hl(asset)` (1000PEPE → kPEPE) перед lookup в кэше.
+- File: `venues/hyperliquid.py:_get_sz_decimals`
+
+**BUG-032** Lighter maker_chase repost_delay < ZK settlement time → ghost orders
+- Symptom: каждая попытка Lighter POST_ONLY заканчивается "no resting order found (already filled)" + position 0. 5 попыток, timeout, HL нога закрыта.
+- Cause: `repost_delay = timeout_s / max_reposts = 30/10 = 3.0s`. ZK rollup Lighter требует ~3-4с на settlement. Мы проверяем position за 3s до settlement → position=0. cancel возвращает None (ордер в mempool, не виден в book). Цикл идёт дальше не зная что ордер валиден.
+- Fix: `repost_delay = max(5.0, timeout_s / max_reposts)`. Гарантирует 5s между place и check — достаточно для ZK settlement.
+- File: `venues/lighter.py:maker_chase_entry`
+
+**BUG-031** Transient funding spike → entry → settlement 35× ниже ожидаемого (XLM)
+- Symptom: вход XLM при 0.0384%/h (336% APR); реальный settlement 23:00 → 0.0012%/h (Lighter), 0.0001%/h (HL). Net spread 0.0011%/h vs ожидаемых 0.0384%/h = 35× разрыв.
+- Cause: Lighter `/funding-rates` возвращает instantaneous predicted rate (current_premium / 8). Реальный settlement = TWAP 60 минутных премиумов за час. 3-мин спайк до 0.04%/h + 57 мин у 0.001%/h → TWAP settlement ≈ 0.003%/h. Spike-filter (z-score) не поймал: z-score был в норме после рестарта с чистой историей.
+- Fix: TWAP confirmation gate — `get_twap_spread(asset, window_s=900)` в `SpreadScanner`. Перед входом требуем 15-мин rolling mean spread ≥ SPREAD_ENTRY_THRESHOLD. Хранилище _spread_history переведено в `_rate_history: Deque[(ts, hl_rate, lt_rate)]` для точного временного окна. Warmup: 10 семплов (~5 мин). Fail-closed: если <10 семплов в окне — skip без кулдауна.
+- Files: `feeds/spread_scanner.py`, `strategies/cross_venue_carry.py`, `core/constants.py`
+
+**BUG-030** Две монеты открываются за один тик
+- Symptom: открылись WLD (15:07) и TAO (15:09) в одном tick-запуске
+- Cause: `open_count` вычислялся один раз в начале `tick()`. Затем `for snap in candidates` делал `await _enter_position()` для всех `n = MAX - open_count` кандидатов без перепроверки. При open_count=0 и MAX=3 → 3 позиции за один тик.
+- Fix: после каждого `_enter_position` пересчитываем `new_count`; если `new_count > open_count` → `break`. Максимум 1 новая позиция за тик. Следующий тик при необходимости откроет ещё одну.
+- File: `strategies/cross_venue_carry.py:tick`
+
+**BUG-029** Bot re-enters WLD (or any asset) after restart despite open position existing on exchange
+- Symptom: Already-open WLD position; bot restarts → `recover_open_positions()` runs → immediately re-enters WLD → doubled margin → emergency close
+- Cause: `recover_open_positions()` calls `self._lt.get_position_for_asset(asset)` which internally calls `get_positions()`. `get_positions()` catches all exceptions and returns `{}` — indistinguishable from "no positions". So if Lighter API fails at startup, `lt_size = 0.0` (not `-1.0` = unknown). Logic: `hl_ok=True, lt_ok=False, lt_unk=False` → **PARTIAL branch** → closes HL leg taker + marks DB ABANDONED. WLD evicted from `self.positions` → scanner picks it up → new entry.
+- Fix: Added `LighterClient.get_position_size_or_raise(asset)` — bypasses all internal exception catching, raises on API error. `recover_open_positions()` now uses this method; outer `except` correctly sets `lt_size = -1.0` (unknown) → `lt_unk=True` → recovery skips PARTIAL close and logs warning instead.
+- File: `venues/lighter.py:get_position_size_or_raise`, `strategies/cross_venue_carry.py:recover_open_positions`
+
 **BUG-019** `emergency_margin` fires immediately after position open → closes after 30 min (fee loss)
 - Cause: no state recovery on `CrossVenueStrategy.__init__`. Restart during open position → new session opens duplicate position on top of orphan → `totalMarginUsed` doubles → `margin_used/usdc_balance` spikes above 65% threshold immediately → `_EMERGENCY_CLOSE_AFTER_S=1800s` timer runs to completion.
 - Fix: `CrossVenueStrategy.recover_open_positions()` — reads OPEN DB cycles, checks exchange (HL `get_perp_position_size` + Lighter `get_position_for_asset`), restores to HOLD or marks ABANDONED/partial-close. Called in `main_cross.py` after strategy init, before tick loop.
@@ -136,3 +179,25 @@ Format: **Error → Cause → Fix → File**
 | HYPE  | 0%/h ❌     | @1035     | spread 2% ✓   | NO (no funding) |
 
 Full e2e testing requires mainnet. On testnet bot correctly skips all assets and idles.
+
+---
+
+**BUG-036** Lighter maker orders "ghost" (no resting order / no fill) on liquid assets (BCH/NEAR/TAO) — root cause of all legging-cover fee drain.
+- Cause: `LighterClient.maker_chase_entry` placed the POST_ONLY at the WRONG side — `price = ask if is_buy else bid`. A buy at the ask (or sell at the bid) is marketable → POST_ONLY killed on-chain → order never rests → position never grows → bot reads "no resting order (already filled)", times out, covers HL leg taker (~$0.13 loss). Intermittent success only when price moved during ZK settlement lag.
+- Fix: `price = bid if is_buy else ask` (passive side). Matches HL convention (hyperliquid.py:419/429 buy→bid, sell→ask). Lighter maker now rests reliably at 0% fee.
+- Also added: (1) HL taker fallback in `_enter_position` if HL maker chase times out (+0.03% fee, recouped in ~1-2h at ~100% APR); (2) unified `_register_entry_fail` streak — ANY entry failure (HL timeout OR Lighter ghost) counts; 3 in a row → 4h blacklist (was Lighter-only, so alternating failures never tripped it).
+- Files: `venues/lighter.py:maker_chase_entry`, `strategies/cross_venue_carry.py:_enter_position` + `_register_entry_fail`
+
+---
+
+**BUG-038** HL funding severely undercounted — `cumFunding.sinceOpen` resets on every HL leg close/reopen (legging covers, recovery after restart), causing chronic undercount.
+- Cause: REST poll used `cumFunding.sinceOpen` which HL resets each time the perp position is closed and reopened. During chaotic sessions (multiple ghost/legging events + restarts), `sinceOpen` was overwritten to a smaller value and the code did `pos.hl_funding_collected = earned_total` (SET, not ADD), losing all prior accumulated funding.
+- Fix: Replaced with `userFunding` REST endpoint (`{"type":"userFunding","user":addr,"startTime":since_ms}`). Returns actual USD amounts like Lighter's positionFunding. Idempotent via `hl_last_funding_time_ms` (ms timestamp of last credited event, persisted to DB). Matches exact figures shown in HL UI.
+- Files: `venues/hyperliquid.py:get_user_funding_history`, `strategies/cross_venue_carry.py:poll_lighter_funding`, `core/models.py`, `database/schema.sql`
+
+---
+
+**BUG-039** Recovery Lighter orphan close: SELL instead of BUY when closing Lighter short orphan — doubled the short position.
+- Cause: `lt_is_buy = (long_v == "lighter")` in partial-recovery close logic. For short_venue="lighter" this evaluates to False → places SELL (adds to short) instead of BUY (closes short).
+- Fix: `lt_is_buy = (short_v == "lighter")` — if Lighter was the short leg, we BUY to close; if Lighter was the long leg, we SELL to close.
+- File: `strategies/cross_venue_carry.py:recover_open_positions` partial-close block

@@ -146,6 +146,7 @@ async def carry_loop() -> None:
     # Link dashboard to live state
     dash.stats     = stats
     dash.positions = strategy.positions
+    dash.scanner   = scanner
 
     # ── Pre-load Lighter market metadata ─────────────────────────────────────
     dlog("Warming up: loading Lighter market metadata...")
@@ -233,8 +234,10 @@ async def carry_loop() -> None:
     last_lt_funding  = int(time.time())
     last_drift_check = int(time.time())
     last_bal_check   = int(time.time())
+    last_snapshot    = 0   # force immediate first snapshot in headless mode
     LT_FUNDING_POLL  = 300  # poll Lighter funding every 5 min
     BAL_POLL         = 60   # refresh balances for dashboard every 60s
+    SNAPSHOT_INTERVAL = 300  # headless status print every 5 min
 
     try:
         while True:
@@ -309,6 +312,15 @@ async def carry_loop() -> None:
 
             # Keep dashboard fresh every tick
             dash.refresh()
+
+            # Headless mode: print full status snapshot to stdout every 5 min
+            if not dash._is_tty and now - last_snapshot >= SNAPSHOT_INTERVAL:
+                dash.hl_balance    = await hl_client.get_usdc_balance()
+                dash.lt_balance    = await lt_client.get_available_balance()
+                dash.opportunities = scanner.ranked[:5]
+                dash.print_snapshot()
+                last_snapshot = now
+
             await asyncio.sleep(TICK_INTERVAL_S)
 
     except asyncio.CancelledError:
@@ -347,11 +359,27 @@ async def carry_loop() -> None:
 
         dlog(f"Session {session_id[:8]} ended | P&L=${stats.total_pnl_usd:+.4f}", "ok")
         dash.stop()
-        await notifier.send_report(stats)
+        await notifier.send_report(stats, final=True)
+
+
+def _check_lighter_sdk() -> None:
+    """Fail immediately at startup if Lighter SDK is not installed — before the
+    spike filter wastes 12 minutes warming up only to crash on first order."""
+    try:
+        from lighter.signer_client import SignerClient  # noqa: F401  type: ignore
+    except ImportError:
+        print(
+            "\n[FATAL] Lighter SDK not installed.\n"
+            "Fix: pip install _sdk_download/lighter_sdk-*.whl --break-system-packages\n"
+            "  or: uv pip install git+https://github.com/elliottech/zklighter-perps-python.git\n",
+            file=sys.stderr,
+        )
+        sys.exit(1)
 
 
 async def main() -> None:
     check_required_env()
+    _check_lighter_sdk()
     await carry_loop()
 
 

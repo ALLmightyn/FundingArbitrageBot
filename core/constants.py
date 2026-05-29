@@ -59,6 +59,7 @@ MAKER_CHASE_MAX_REPOSTS: int = 15        # Max price-chases before waiting
 MAKER_CHASE_REPOST_DELAY_S: float = 2.0  # Seconds between repost checks
 MAKER_CHASE_TIMEOUT_S: float = 30.0      # Total time before taker fallback on cover leg
 MAKER_EXIT_TIMEOUT_S: float = 120.0      # Total time for maker exit before taker fallback
+LT_ENTRY_TIMEOUT_S: float = 90.0        # Lighter entry leg: longer wait since HL is hedged
 SPOT_TAKER_FALLBACK_S: float = 20.0      # Spot maker timeout before emergency taker buy (naked short prevention)
 
 # ── Funding scanner ──────────────────────────────────────────────────────────
@@ -101,8 +102,6 @@ LIGHTER_EXPLORER_URL: str = "https://explorer.elliot.ai/api"
 # ── Cross-Venue Spread Thresholds ─────────────────────────────────────────────
 # Total round-trip cost = 2 × HL_perp_maker (0.015%) + 2 × Lighter_maker (0.0%)
 #   = 0.030% of notional.
-# At SPREAD_ENTRY_THRESHOLD=0.0001/h on $300: $0.03/h revenue.
-# With MIN_HOLD=4h: $0.12 revenue > $0.09 fees → +$0.03 net.
 # ── Spread entry/exit thresholds ─────────────────────────────────────────────
 # Cost breakdown per round-trip:
 #   HL perp maker entry:  0.015%
@@ -113,33 +112,39 @@ LIGHTER_EXPLORER_URL: str = "https://explorer.elliot.ai/api"
 #   ----------------------------------
 #   Total worst-case:     0.050%
 #
-# At SPREAD_ENTRY_THRESHOLD = 0.0003/h and $300 notional:
-#   Hourly income: 0.0003 * $300 = $0.09/h
-#   Total costs (0.050%): $0.15
-#   Break-even: 0.15 / 0.09 = 1.67h  → safe with MIN_HOLD=4h
-#
-# The 0.0001/h threshold was too low — the "fake cluster" assets (HL=0.010%,
-# LT=0.0096%, spread=0.0004%/h) would break even at 75h but MAX_HOLD=72h
-# → guaranteed loss. 0.0003/h clears this cleanly.
-SPREAD_ENTRY_THRESHOLD: float = 0.00030    # 0.030%/h minimum spread (after slippage buffer)
-SPREAD_EXIT_THRESHOLD: float  = 0.00010    # 0.010%/h — soft exit (maker close)
-SPREAD_EXIT_FLIP: float       = -0.00005   # -0.005%/h — hard flip (taker close immediately)
+# At SPREAD_ENTRY_THRESHOLD = 0.00015/h and $25 notional (TEST):
+#   Hourly income: 0.00015 * $25 = $0.00375/h
+#   Total costs (0.050%): $25 * 0.0005 = $0.0125
+#   Break-even: $0.0125 / $0.00375 = 3.33h → safe with MIN_HOLD=4h
+#   Real NEAR cycle ran at 0.01155%/h → profitable → 0.00015 includes it.
+# Calibrated 2026-05-29 against live 24h historical paired settlements (HL + Lighter):
+#   BCH 0.0056%/h, ADA 0.0045, DOT 0.0031, APT 0.0024, BNB 0.0018, AVAX 0.0010
+# Threshold 0.025%/h would block 100% of assets on a quiet market → bot idle.
+# At 0.005%/h (44% APR) about half the whitelist would qualify in normal regimes,
+# matching podcast practitioner baseline ("50-100% годовых средняя доходность").
+# Break-even math @ $25/leg: 0.005% × $25 = $0.00125/h vs $0.0074 round-trip fees →
+# 5.9h to recoup — safe with CROSS_MIN_HOLD_HOURS=8.
+SPREAD_ENTRY_THRESHOLD: float = 0.00005    # 0.005%/h (~44% APR) — realistic sustained carry
+SPREAD_EXIT_THRESHOLD: float  = 0.00002    # 0.002%/h (~17.5% APR) — exit when carry decays
+SPREAD_EXIT_FLIP: float       = -0.00002   # -0.002%/h — hard flip (taker close immediately)
 
 # Maximum allowed bid-ask spread on Lighter order book before entry.
 # If Lighter's top-of-book spread is wider than this, skip the asset
 # (indicates thin market, slippage would exceed profit).
 MAX_LIGHTER_BOOK_SPREAD_PCT: float = 0.003  # 0.3% max bid-ask spread
 
-# Cross-venue hold time
-CROSS_MIN_HOLD_HOURS: int = 4
-CROSS_MAX_HOLD_HOURS: int = 48   # reduced from 72: funding rates can reverse in days
+# Cross-venue hold time. Min 8h ensures we cover 8 hourly settlements at the
+# new 0.005%/h threshold — 8 × 0.00125 = $0.010 > $0.0074 round-trip fees, so
+# even a position that stays exactly at threshold is guaranteed positive.
+CROSS_MIN_HOLD_HOURS: int = 8
+CROSS_MAX_HOLD_HOURS: int = 48
 
 # Cross-venue position sizing
 # ── TEST MODE ($100/side) ────────────────────────────────────────────────────
 # $25/leg keeps HL margin ~$8-12 (2-3× lev) and covers min order sizes on most
 # assets (ETH 0.01=~$25, SOL 0.1=~$15, TAO 0.01=~$4). Raise to $150+ for live.
 CROSS_POSITION_SIZE_USD: float = 25.0      # per-leg USD notional  ← TEST
-CROSS_MAX_POSITIONS: int = 1               # max concurrent pairs  ← TEST
+CROSS_MAX_POSITIONS: int = 1               # 1 position at a time (deliberate — single active cycle)
 
 # Minimum Lighter free balance required before opening a new position
 # (protects against over-leveraging Lighter side)
@@ -160,34 +165,65 @@ FEE_CROSS_TOTAL_ESTIMATE: float = 0.00050  # 0.050% total worst-case cost
 
 # Only trade these assets — liquid perps available on both HL and Lighter
 # (prevents bot from entering thin-book alts where slippage kills the trade)
+# Symbol name mapping between Lighter (canonical) and Hyperliquid.
+# Lighter uses "1000X" prefix; HL uses "kX" for the same 1000× contracts.
+# Keys = Lighter names, Values = HL names.
+LIGHTER_TO_HL_SYMBOL: dict = {
+    "1000PEPE":  "kPEPE",
+    "1000SHIB":  "kSHIB",
+    "1000BONK":  "kBONK",
+    "1000FLOKI": "kFLOKI",
+}
+HL_TO_LIGHTER_SYMBOL: dict = {v: k for k, v in LIGHTER_TO_HL_SYMBOL.items()}
+
 # Note: MAX_LIGHTER_BOOK_SPREAD_PCT is a second-line filter for thin books.
 # Whitelist catches assets without reliable Lighter markets entirely.
 CROSS_VENUE_WHITELIST: set = {
-    # Large-caps
+    # Tier 1: large-caps with deep books and stable funding history.
+    # Per podcast wisdom: stick to "большие монеты с минимальными спредами".
+    # Smaller / new assets see manipulation and funding spikes that revert before
+    # settlement, eating fees. The historical stability check still gates entries,
+    # but a smaller whitelist saves scanner time and reduces accidental exposure.
     "BTC", "ETH", "SOL", "BNB", "XRP", "DOGE", "ADA", "AVAX",
-    "LINK", "DOT", "NEAR", "AAVE", "BCH", "XMR", "LTC", "ATOM",
-    "UNI", "ARB", "OP", "SUI", "APT", "INJ", "TIA", "FIL",
-    "MKR", "COMP", "CRV", "TAO", "PENDLE",
-    # Mid-caps with consistent Lighter liquidity (verified 2026-05-27)
-    "XLM", "WLD", "ZEC", "1000PEPE", "TRUMP",
-    # Commodity & FX perps (active on both venues)
-    "WTI", "BRENTOIL", "USDJPY",
-    # Recent high-spread assets — confirmed >0.03%/h spread, book spread <0.3%
-    "0G", "FOGO", "STABLE", "TSM",
+    "LINK", "DOT", "AAVE", "BCH", "LTC", "ATOM", "UNI", "SUI",
+    "ARB", "OP", "APT", "TAO", "NEAR",
 }
 
 # Scan interval for cross-venue spread scanner
-SPREAD_SCAN_INTERVAL_S: int = 60
+SPREAD_SCAN_INTERVAL_S: int = 30
 
-# Cooldown after cross-venue exit
-CROSS_EXIT_COOLDOWN_S: int = 300
+# Cooldown after cross-venue exit. Raised to 15 min to avoid bouncing into the
+# same asset right after exit when its spike-then-revert pattern is still active.
+CROSS_EXIT_COOLDOWN_S: int = 900
 
 # ── Anti-spike entry filter (borrowed from Gajesh2007/funding-arb-bot) ───────
 # Reject entry if current spread > rolling_mean + N*sigma — funding spike
 # is likely to revert before MIN_HOLD elapses, leaving you holding the bag.
-SPIKE_SIGMA_THRESHOLD: float = 2.0       # 2 standard deviations
-SPIKE_HISTORY_MIN_SAMPLES: int = 12      # ~12 min at 60s scan interval
-SPIKE_HISTORY_MAX_SAMPLES: int = 1440    # ~24h rolling window at 60s
+SPIKE_SIGMA_THRESHOLD: float = 2.5       # 2.5 sigma — less aggressive rejection, fewer missed entries
+SPIKE_HISTORY_MIN_SAMPLES: int = 5       # ~5 min warmup (was 12) — faster first entry
+SPIKE_HISTORY_MAX_SAMPLES: int = 2880    # ~24h rolling window at 30s intervals
+
+# ── TWAP entry confirmation gate ──────────────────────────────────────────────
+# Lighter /funding-rates returns instantaneous predicted rate (current premium/8).
+# Actual settlement = TWAP of 60 per-minute premiums over the hour.
+# A 3-min spike at 0.04%/h with 57 min at 0.001%/h → TWAP settlement ≈ 0.003%/h.
+# Gate: require the 30-min rolling mean spread to be above threshold before entry.
+# 30 min covers half a settlement period — strong predictor of next TWAP.
+SPREAD_TWAP_WINDOW_S: int  = 1800  # 30-min lookback for TWAP gate
+SPREAD_TWAP_MIN_SAMPLES: int = 20  # ~10 min of samples at 30s scan interval (fail-closed)
+
+# ── Historical stability filter (primary defence against fake-spike carries) ──
+# Even after TWAP confirms a sustained 15-30 min spread, the asset may still
+# have been a 100%/h spike that's been flat for the past 24h. We pull HL's real
+# hourly TWAP settlements and require ≥60% of recent hours to have been above
+# threshold in our shorting direction. If NEAR averaged 0.0007%/h for 24h with
+# max 0.0013%/h, no number of TWAP-confirmed spikes makes it a real carry.
+# Per podcast wisdom: "стабильный фандинг в течение месяца" — the sustainable
+# pattern. NEAR live data: 0/24 settlements ≥ 0.025% → would have been rejected.
+STABILITY_LOOKBACK_HOURS: int   = 24      # hours of HL settlement history to inspect
+STABILITY_MIN_HIT_RATIO: float  = 0.25    # 25% of past hours must be above threshold
+# Note: was 0.50, lowered to 0.25 because most good carries are episodic (OP=37%, ADA=25%).
+# The TWAP gate (30 min) already guards against entering at a bad moment.
 
 # ── Price divergence guard ────────────────────────────────────────────────────
 # If HL mid and Lighter mid for the same asset diverge by > this %, one venue's

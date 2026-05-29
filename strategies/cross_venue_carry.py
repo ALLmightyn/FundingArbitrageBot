@@ -44,6 +44,7 @@ from core.constants import (
     SPREAD_EXIT_FLIP,
     CROSS_EXIT_COOLDOWN_S,
     MAKER_CHASE_TIMEOUT_S,
+    LT_ENTRY_TIMEOUT_S,
     FEE_CROSS_ROUND_TRIP,
     FEE_PERP_MAKER,
     FEE_PERP_TAKER,
@@ -56,6 +57,7 @@ from core.constants import (
     PRICE_DIVERGENCE_KILL_PCT,
     PORTFOLIO_DRAWDOWN_KILL_USD,
     DRIFT_TOLERANCE_PCT,
+    SPREAD_TWAP_MIN_SAMPLES,
 )
 from core.logger import log, log_warn, crash_log
 from core.models import CrossVenuePosition, CrossVenueState, SpreadSnapshot, SessionStats
@@ -113,6 +115,14 @@ class CrossVenueStrategy:
         # Valid for any CROSS_MAX_POSITIONS (unlike account-level collateral delta).
         self._lt_last_funding_poll: Dict[str, float] = {}
 
+        # Consecutive entry-failure counter per asset (ANY leg: HL maker timeout
+        # OR Lighter ghost). If an asset fails N times in a row it gets a long
+        # cooldown so we stop spinning / burning cover fees on something that
+        # won't fill cleanly as maker.
+        self._entry_fail_streak: Dict[str, int] = {}
+        self._ENTRY_FAIL_STREAK_LIMIT = 3        # 3 fails → 4h blacklist
+        self._ENTRY_FAIL_LONG_COOLDOWN_S = 14400 # 4 hours
+
     # ── State recovery on restart ─────────────────────────────────────────────
 
     async def recover_open_positions(self) -> None:
@@ -164,8 +174,10 @@ class CrossVenueStrategy:
                 hl_size = -1.0  # unknown
 
             try:
-                lt_pos  = await self._lt.get_position_for_asset(asset)
-                lt_size = abs(float((lt_pos or {}).get("base_amount", 0) or 0))
+                # Use or_raise variant: get_position_for_asset() swallows exceptions
+                # and returns None on API error — indistinguishable from "no position".
+                # That causes lt_size=0.0 → PARTIAL branch → HL leg closed → duplicate entry.
+                lt_size = await self._lt.get_position_size_or_raise(asset)
             except Exception as e:
                 log_warn(f"CrossVenue.recover: {asset} Lighter check failed: {e}")
                 lt_size = -1.0  # unknown
@@ -195,6 +207,14 @@ class CrossVenueStrategy:
                     entry_fee_usd=float(r["entry_fee_usd"] or 0),
                     hl_funding_collected=float(r["hl_funding_collected"] or 0),
                     lighter_funding_collected=float(r["lighter_funding_collected"] or 0),
+                    lighter_last_funding_id=int(
+                        r["lighter_last_funding_id"]
+                        if "lighter_last_funding_id" in r.keys() else 0
+                    ),
+                    hl_last_funding_time_ms=int(
+                        r["hl_last_funding_time_ms"]
+                        if "hl_last_funding_time_ms" in r.keys() else 0
+                    ),
                     cycle_id=cycle_id,
                 )
                 self.positions[asset] = pos
@@ -207,6 +227,23 @@ class CrossVenueStrategy:
                     f"HL={hl_size:.4f} LT={lt_size:.4f} units={units:.4f} "
                     f"age={age_h:.1f}h"
                 )
+
+                # ── One-time reconciliation: replace stale rate×time accounting ──
+                # If lighter_last_funding_id == 0 but lighter_funding_collected != 0,
+                # the persisted amount came from the old rate×time estimator (which
+                # over-credits by ~3×). Wipe it and re-poll real settlements via
+                # positionFunding API. Next poll_lighter_funding() will populate
+                # correctly from entered_at onward (idempotent via funding_id).
+                if pos.lighter_last_funding_id == 0 and abs(pos.lighter_funding_collected) > 0:
+                    stale = pos.lighter_funding_collected
+                    pos.lighter_funding_collected = 0.0
+                    self._stats.total_funding_usd -= stale
+                    log_warn(
+                        f"CrossVenue.recover: {asset} stale lighter_funding "
+                        f"${stale:+.5f} dropped (was rate×time estimate); "
+                        f"real settlements will be loaded from positionFunding API"
+                    )
+                    await self._db_update_funding(pos)
 
             elif not hl_ok and not lt_ok and not hl_unk and not lt_unk:
                 # ── No legs on exchange — ghost ───────────────────────────
@@ -228,17 +265,35 @@ class CrossVenueStrategy:
                 if hl_ok:
                     try:
                         hl_is_buy = (long_v == "hl")  # close: flip direction
+                        book = await self._hl.get_l2_book(asset)
+                        levels = (book or {}).get("levels", [[], []])
+                        bids, asks = levels[0], levels[1]
+                        if hl_is_buy:
+                            mid = float(asks[0]["px"]) * 1.05 if asks else 999999.0
+                        else:
+                            mid = float(bids[0]["px"]) * 0.95 if bids else 0.001
                         await self._hl.place_taker(
-                            asset, is_buy=hl_is_buy, size=hl_size, reduce_only=True
+                            asset, is_buy=hl_is_buy, size=hl_size, price=mid, reduce_only=True
                         )
                         log(f"CrossVenue.recover: {asset} HL orphan closed (taker)")
                     except Exception as e:
                         crash_log(f"CrossVenue.recover.close_hl.{asset}", e)
                 if lt_ok:
                     try:
-                        lt_is_buy = (long_v == "lighter")  # close: flip direction
-                        await self._lt.place_taker(asset, is_buy=lt_is_buy, size=lt_size)
-                        log(f"CrossVenue.recover: {asset} Lighter orphan closed (taker)")
+                        # To CLOSE a Lighter position: if we were SHORT on Lighter
+                        # (short_venue=="lighter") we need to BUY to close.
+                        # If we were LONG on Lighter we need to SELL.
+                        lt_is_buy = (short_v == "lighter")
+                        lt_bid, lt_ask = await self._lt.get_best_prices(asset)
+                        # Aggressive cross price to guarantee IOC fill
+                        if lt_is_buy:
+                            lt_px = lt_ask * 1.05 if lt_ask > 0 else 999999.0
+                        else:
+                            lt_px = lt_bid * 0.95 if lt_bid > 0 else 0.0001
+                        await self._lt.place_taker(
+                            asset, is_buy=lt_is_buy, size=lt_size, price=lt_px
+                        )
+                        log(f"CrossVenue.recover: {asset} Lighter orphan closed (taker) @ {lt_px}")
                     except Exception as e:
                         crash_log(f"CrossVenue.recover.close_lt.{asset}", e)
                 async with get_db() as c2:
@@ -282,14 +337,26 @@ class CrossVenueStrategy:
                 if p.state in (CrossVenueState.HOLD, CrossVenueState.ENTERING)
             )
             if open_count < CROSS_MAX_POSITIONS:
+                _n_slots = CROSS_MAX_POSITIONS - open_count
+                # Request extra candidates as fallback for assets on cooldown.
+                # With MAX=1, without the buffer, top candidate on cooldown → entire tick idle.
                 candidates = self._scanner.best_candidates(
-                    n=CROSS_MAX_POSITIONS - open_count,
+                    n=_n_slots + max(5, len(self._entry_cooldowns)),
                     exclude=set(self.positions.keys()),
                 )
                 for snap in candidates:
                     if now < self._entry_cooldowns.get(snap.asset, 0):
                         continue
                     await self._enter_position(snap)
+                    # At most 1 new entry per tick: break if a position was actually
+                    # added (succeeded). If entry was skipped/failed (position deleted or
+                    # never added), open_count stays the same and we try the next candidate.
+                    new_count = sum(
+                        1 for p in self.positions.values()
+                        if p.state in (CrossVenueState.HOLD, CrossVenueState.ENTERING)
+                    )
+                    if new_count > open_count:
+                        break
 
         # 3. Rebalance check
         await self._check_rebalance()
@@ -355,6 +422,41 @@ class CrossVenueStrategy:
             crash_log(f"CrossVenue.sigma_check.{asset}", e)
             return  # fail-closed on error: do not enter if spike check fails
 
+        # 5. TWAP confirmation gate — primary defence against transient spike entries.
+        # Lighter /funding-rates is an instantaneous predicted rate; actual settlement
+        # is the hourly TWAP. A 3-min spike at 0.04%/h → settlement ≈ 0.003%/h.
+        # Require the 15-min rolling mean spread to be ≥ entry threshold before entry.
+        try:
+            twap_spread, twap_valid = self._scanner.get_twap_spread(asset)
+            if not twap_valid:
+                samples = len(self._scanner._rate_history.get(asset) or [])
+                log(
+                    f"CrossVenue: {asset} TWAP gate warming up — "
+                    f"skipping ({samples}/{SPREAD_TWAP_MIN_SAMPLES} samples in window)"
+                )
+                return  # no cooldown — retry next tick as history accumulates
+            if twap_spread < SPREAD_ENTRY_THRESHOLD:
+                log_warn(
+                    f"CrossVenue: {asset} TWAP {twap_spread*100:.4f}%/h "
+                    f"< threshold {SPREAD_ENTRY_THRESHOLD*100:.3f}%/h "
+                    f"(instant={snap.spread*100:.4f}%/h, ratio={snap.spread/twap_spread:.1f}×) "
+                    f"— transient spike, skipping"
+                )
+                self._set_cooldown(asset)
+                return
+            log(
+                f"CrossVenue: {asset} TWAP {twap_spread*100:.4f}%/h ✓ "
+                f"(instant={snap.spread*100:.4f}%/h, ratio={snap.spread/twap_spread:.1f}×)"
+            )
+        except Exception as e:
+            crash_log(f"CrossVenue.twap_check.{asset}", e)
+            return  # fail-closed
+
+        # NOTE: historical stability is now baked into the scanner's ranking
+        # (refresh_historical_stats + hot-path ranking). Assets only appear in
+        # ranked candidates if they have ≥50% hit ratio against the threshold
+        # over the past 24h. No separate gate here — keeping the flow simpler.
+
         log(
             f"CrossVenue: entering {asset} | spread={snap.spread*100:.4f}%/h "
             f"({snap.spread_pct_annual:.1f}% APR) | "
@@ -370,7 +472,7 @@ class CrossVenueStrategy:
         # Get mark price for sizing (use HL price as canonical)
         mark_price = snap.hl_mark_px or 0.0
         if mark_price <= 0:
-            # Fallback: get from order book
+            # Fallback 1: HL L2 book mid
             try:
                 book = await self._hl.get_l2_book(asset)
                 levels = book.get("levels", [[], []])
@@ -381,6 +483,11 @@ class CrossVenueStrategy:
                 )
             except Exception:
                 pass
+        if mark_price <= 0:
+            # Fallback 2: Lighter mid price (lt_bid/lt_ask already fetched above)
+            if lt_bid > 0 and lt_ask > 0:
+                mark_price = (lt_bid + lt_ask) / 2
+                log(f"CrossVenue: {asset} using Lighter mid {mark_price:.6f} as price fallback")
         if mark_price <= 0:
             log_warn(f"CrossVenue: cannot determine price for {asset}, skipping")
             return
@@ -409,15 +516,44 @@ class CrossVenueStrategy:
             side_label=hl_label,
         )
 
+        hl_via_taker = False
         if hl_order_id is None:
-            log_warn(f"CrossVenue: {asset} HL leg failed — aborting entry")
-            self._set_cooldown(asset)
+            # Maker chase couldn't fill within the timeout — common on ultra-liquid
+            # assets (BCH) where the touch moves faster than we can rest. Taker
+            # fallback: cross IOC so we still capture the carry. The extra perp-taker
+            # cost (+0.03% over maker) is recouped in ~1-2h of hold at ~100% APR.
+            log_warn(f"CrossVenue: {asset} HL maker timed out — taker fallback")
+            try:
+                book = await self._hl.get_l2_book(asset)
+                levels = book.get("levels", [[], []])
+                if hl_is_buy:
+                    raw_px = float(levels[1][0]["px"]) * 1.005 if levels[1] else mark_price * 1.02
+                else:
+                    raw_px = float(levels[0][0]["px"]) * 0.995 if levels[0] else mark_price * 0.98
+                px = self._hl.round_price(raw_px)
+                await self._hl.place_taker(asset, is_buy=hl_is_buy, size=units, price=px)
+                await asyncio.sleep(1.5)  # let IOC fill settle before reading position
+                cl = await self._hl.get_clearinghouse()
+                for ap in cl.get("assetPositions", []):
+                    p = ap.get("position", {})
+                    if p.get("coin") == asset and abs(float(p.get("szi", 0) or 0)) >= units * 0.9:
+                        hl_order_id = "taker"
+                        hl_via_taker = True
+                        break
+            except Exception as e:
+                crash_log(f"CrossVenue.hl_taker_fallback.{asset}", e)
+
+        if hl_order_id is None:
+            log_warn(f"CrossVenue: {asset} HL leg failed (maker+taker) — aborting entry")
             del self.positions[asset]
+            await self._register_entry_fail(asset, "HL leg unfillable (maker+taker)")
             return
 
         pos.hl_order_id = hl_order_id
         pos.hl_entry_price = mark_price  # will be refined below from clearinghouse
-        pos.entry_fee_usd += CROSS_POSITION_SIZE_USD * FEE_PERP_MAKER
+        pos.entry_fee_usd += CROSS_POSITION_SIZE_USD * (
+            FEE_PERP_TAKER if hl_via_taker else FEE_PERP_MAKER
+        )
 
         # Read actual HL fill price from clearinghouse (entryPx is the real avg fill).
         # mark_price was just the mid at order time — can differ by 0.1-0.3% on volatility.
@@ -441,24 +577,22 @@ class CrossVenueStrategy:
         log(f"CrossVenue: {asset} HL leg filled @ {pos.hl_entry_price:.6f} — now opening Lighter leg")
 
         # ── Step 2: Open Lighter leg ──────────────────────────────────────────
+        # Use a longer timeout than the cover leg: HL is already hedged so waiting
+        # 90s is safe and gives the maker order time to fill on a slow market.
         lt_label = f"Lighter {'short' if not lt_is_buy else 'long'}"
         lt_order_id = await self._lt.maker_chase_entry(
             asset=asset,
             is_buy=lt_is_buy,
             size=units,
             label=lt_label,
-            timeout_s=MAKER_CHASE_TIMEOUT_S,
+            timeout_s=LT_ENTRY_TIMEOUT_S,
         )
 
         if lt_order_id is None:
             log_warn(f"CrossVenue: {asset} Lighter leg failed — covering HL leg")
             await self._cover_naked_hl_leg(asset, pos)
-            self._set_cooldown(asset)
             del self.positions[asset]
-            await self._notify(
-                f"⚠️ <b>CrossVenue: {asset} entry failed</b>\n"
-                f"Lighter leg timed out — HL leg covered. Cooldown {CROSS_EXIT_COOLDOWN_S}s."
-            )
+            await self._register_entry_fail(asset, "Lighter ghost — HL leg covered")
             return
 
         # ── Both legs filled ──────────────────────────────────────────────────
@@ -487,8 +621,11 @@ class CrossVenueStrategy:
         pos.entry_fee_usd += 0.0  # Lighter maker fee = 0%
         pos.mark_entered()
 
+        # Anchor HL funding idempotency to entry time so we don't accidentally
+        # credit userFunding events from before this position was opened.
+        pos.hl_last_funding_time_ms = int(time.time() * 1000)
+
         # Initialize per-position Lighter funding poll timer.
-        # poll_lighter_funding() will accrue rate × elapsed_hours × notional from here.
         self._lt_last_funding_poll[asset] = time.time()
 
         # Persist to DB
@@ -496,6 +633,7 @@ class CrossVenueStrategy:
         pos.cycle_id = cycle_id
         await self._db_insert_cycle(pos)
 
+        self._entry_fail_streak[asset] = 0  # successful entry resets fail streak
         self._stats.total_cycles += 1
         log(
             f"CrossVenue: {asset} ENTERED | "
@@ -545,24 +683,44 @@ class CrossVenueStrategy:
         except Exception as e:
             crash_log(f"CrossVenue.divergence_check.{asset}", e)
 
-        # Check spread conditions
-        current_spread = snap.spread
-        # Effective spread sign: positive if short_venue still has higher rate
-        if snap.short_venue != pos.short_venue:
-            # Spread flipped sign — the venue we shorted now has LOWER rate
-            effective_spread = -current_spread
+        # Check spread conditions — exit decisions use TWAP, not instant.
+        # Settlement is hourly TWAP; instant rate can spike and revert. An exit
+        # based on instant could close on a transient blip; an exit blocked by
+        # an instant spike could keep us in a losing position. TWAP matches what
+        # the exchange actually credits each hour.
+        twap_abs, twap_valid = self._scanner.get_twap_spread(asset)
+        instant_abs = snap.spread
+
+        if twap_valid:
+            decision_abs = twap_abs
+            twap_label = f"TWAP={twap_abs*100:.4f}%/h"
         else:
-            effective_spread = current_spread
+            # Fall back to instant if TWAP cannot be computed (cold history).
+            # Conservative: this just means exit uses the same data as before.
+            decision_abs = instant_abs
+            twap_label = "TWAP=unavailable"
+
+        # Effective spread sign: positive if short_venue still has higher rate
+        sign = -1.0 if snap.short_venue != pos.short_venue else 1.0
+        effective_spread = sign * decision_abs
 
         # 1. Hard exit: spread flipped, we're now paying net funding
         if effective_spread <= SPREAD_EXIT_FLIP and hold_h >= 0.25:
-            log(f"CrossVenue: {asset} SPREAD FLIP exit | effective={effective_spread*100:.4f}%/h")
+            log(
+                f"CrossVenue: {asset} SPREAD FLIP exit | "
+                f"effective={effective_spread*100:.4f}%/h ({twap_label}, "
+                f"instant={instant_abs*100:.4f}%/h)"
+            )
             await self._close_position(asset, pos, reason="spread_flip", use_taker=True)
             return
 
         # 2. Soft exit: spread too small to justify staying
         if effective_spread <= SPREAD_EXIT_THRESHOLD and hold_h >= CROSS_MIN_HOLD_HOURS:
-            log(f"CrossVenue: {asset} SOFT EXIT | spread={effective_spread*100:.4f}%/h < threshold")
+            log(
+                f"CrossVenue: {asset} SOFT EXIT | "
+                f"effective={effective_spread*100:.4f}%/h < threshold "
+                f"({twap_label}, instant={instant_abs*100:.4f}%/h)"
+            )
             await self._close_position(asset, pos, reason="spread_soft_exit", use_taker=False)
             return
 
@@ -874,87 +1032,84 @@ class CrossVenueStrategy:
         if not self.positions:
             return
 
-        # ── HL: cumFunding.sinceOpen from clearinghouse REST ─────────────────
-        # CRITICAL SIGN CONVENTION:
-        #   HL cumFunding.sinceOpen   → COST convention: positive = funding PAID
-        #                                                 negative = funding EARNED
-        #   HL WS userFundings.usdc   → P&L convention:  positive = EARNED
-        #                                                 negative = PAID
-        # Our pos.hl_funding_collected stores P&L (positive = earned), so we must
-        # NEGATE sinceOpen when assigning. Previous version did `= since_open`
-        # which doubled the bug: wrong sign + double-count vs WS events.
+        # ── HL: real settled payments via userFunding REST ───────────────────
+        # Uses HL's userFunding endpoint (same data as the HL UI "Funding" tab).
+        # Returns actual USD amounts — not rates — so no approximation needed.
+        # Idempotency: hl_last_funding_time_ms tracks the last event time credited.
+        # Survives restarts because it's persisted to DB and loaded in recovery.
+        # Replaces cumFunding.sinceOpen which resets on every HL leg close/reopen
+        # (legging covers, restart recovery) causing chronic undercounting (BUG-038).
         try:
-            state = await self._hl.get_clearinghouse()
-            for ap in state.get("assetPositions", []):
-                pos_data = ap.get("position", {})
-                asset    = pos_data.get("coin", "")
-                pos      = self.positions.get(asset)
-                if pos is None or pos.state != CrossVenueState.HOLD:
+            for asset, pos in list(self.positions.items()):
+                if pos.state != CrossVenueState.HOLD:
                     continue
-                cum        = pos_data.get("cumFunding", {})
-                since_open = float(cum.get("sinceOpen", 0) or 0)
-                # Convert HL cost convention → our P&L convention by negating.
-                earned_total = -since_open
-                delta = earned_total - pos.hl_funding_collected
-                if abs(delta) > 0.000001:
-                    pos.hl_funding_collected = earned_total
-                    self._stats.total_funding_usd += delta
+                since_ms = pos.hl_last_funding_time_ms or (int(pos.entered_at or 0) * 1000)
+                events = await self._hl.get_user_funding_history(asset, since_ms=since_ms)
+                if not events:
+                    continue
+                new_total = 0.0
+                max_time_ms = pos.hl_last_funding_time_ms
+                for ev in events:
+                    if ev["time_ms"] <= pos.hl_last_funding_time_ms:
+                        continue
+                    new_total += ev["usdc"]
+                    if ev["time_ms"] > max_time_ms:
+                        max_time_ms = ev["time_ms"]
                     log(
-                        f"HLFunding[REST]: {asset} cumSinceOpen(cost)=${since_open:+.5f} "
-                        f"earned=${earned_total:+.5f} (delta=${delta:+.5f})"
+                        f"HLFunding[settled]: {asset} ${ev['usdc']:+.6f} "
+                        f"rate={ev['rate']*100:.4f}%/h szi={ev['szi']}"
                     )
+                if max_time_ms > pos.hl_last_funding_time_ms:
+                    pos.hl_funding_collected += new_total
+                    pos.hl_last_funding_time_ms = max_time_ms
+                    self._stats.total_funding_usd += new_total
                     await self._db_update_funding(pos)
         except Exception as e:
             crash_log("CrossVenue.poll_hl_funding_rest", e)
 
-        # ── Lighter: rate × time × notional (valid for any CROSS_MAX_POSITIONS) ─
-        # Each position independently accrues: sign × rate × notional × elapsed_hours.
-        # sign = +1 if we're SHORT on Lighter (positive rate earns us money),
-        #        -1 if we're LONG  on Lighter (positive rate costs us money).
-        # Rate from scanner snapshot refreshed every 60s — accuracy is ±poll_interval.
-        # This replaces the old account-level collateral-delta approach which was
-        # broken whenever CROSS_MAX_POSITIONS > 1 (couldn't attribute per-asset).
+        # ── Lighter: REAL settlement events via positionFunding API ──────────
+        # Replaces the inaccurate rate×time accounting that was reading instantaneous
+        # rate (premium/8) and overestimating by ~3-3.5×. Lighter settles each hour
+        # as TWAP of 60 per-minute premiums — only the API exposes the real number.
+        #
+        # Idempotency: lighter_last_funding_id tracks the highest funding_id we've
+        # credited. Restart-safe — recovery loads it from DB, so re-polling cannot
+        # double-credit. API returns ALL fundings for the market; we filter by
+        # entered_at and funding_id > last_seen.
         try:
-            now_s = time.time()
             for asset, pos in list(self.positions.items()):
                 if pos.state != CrossVenueState.HOLD:
                     continue
-
-                snap = self._scanner.get_snapshot(asset)
-                if snap is None:
+                # `change` field convention: API returns positive when the position
+                # EARNED (regardless of side). Confirmed by NEAR SHORT events showing
+                # change=+0.001229 matching the exchange UI ($+0.001229).
+                fundings = await self._lt.get_position_fundings(
+                    asset, since_ts=pos.entered_at or 0
+                )
+                if not fundings:
                     continue
-
-                last_poll = self._lt_last_funding_poll.get(asset)
-                if last_poll is None:
-                    # Timer not yet set (entry happened before this session?).
-                    # Initialize here; funding for the gap is untracked — acceptable.
-                    self._lt_last_funding_poll[asset] = now_s
-                    log(f"LighterFunding: {asset} poll timer initialized (late)")
-                    continue
-
-                elapsed_hours = (now_s - last_poll) / 3600.0
-                if elapsed_hours < 0.001:  # < 3.6s — ignore noise
-                    continue
-
-                # Positive Lighter rate → longs pay shorts (standard convention).
-                lt_is_short = (pos.short_venue == "lighter")
-                sign = 1.0 if lt_is_short else -1.0
-                theoretical = sign * snap.lighter_rate * pos.notional_usd * elapsed_hours
-
-                # Always advance the timer (even if theoretical ≈ 0 from low rate).
-                self._lt_last_funding_poll[asset] = now_s
-
-                if abs(theoretical) > 0.0000001:
-                    pos.lighter_funding_collected += theoretical
-                    self._stats.total_funding_usd += theoretical
+                new_total = 0.0
+                max_id = pos.lighter_last_funding_id
+                for f in fundings:
+                    fid = f["funding_id"]
+                    if fid <= pos.lighter_last_funding_id:
+                        continue
+                    amount = f["change_usd"]
+                    new_total += amount
+                    if fid > max_id:
+                        max_id = fid
                     log(
-                        f"LighterFunding[rate×time]: {asset} {theoretical:+.5f} "
-                        f"(rate={snap.lighter_rate*100:.4f}%/h × {elapsed_hours:.3f}h × "
-                        f"${pos.notional_usd:.0f}, {'short' if lt_is_short else 'long'})"
+                        f"LighterFunding[settled]: {asset} ${amount:+.6f} "
+                        f"rate={f['rate']*100:.4f}%/h side={f['side']} "
+                        f"id={fid} ts={f['timestamp']}"
                     )
+                if max_id > pos.lighter_last_funding_id:
+                    pos.lighter_funding_collected += new_total
+                    pos.lighter_last_funding_id = max_id
+                    self._stats.total_funding_usd += new_total
                     await self._db_update_funding(pos)
         except Exception as e:
-            crash_log("CrossVenue.poll_lighter_funding_rate", e)
+            crash_log("CrossVenue.poll_lighter_funding_settled", e)
 
     # ── Database helpers ──────────────────────────────────────────────────────
 
@@ -966,8 +1121,8 @@ class CrossVenueStrategy:
                        (id, asset, short_venue, long_venue, entered_at, notional_usd,
                         units, hl_entry_price, lighter_entry_price,
                         hl_rate_at_entry, lighter_rate_at_entry, spread_at_entry,
-                        entry_fee_usd, state)
-                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                        entry_fee_usd, hl_last_funding_time_ms, state)
+                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                     (
                         pos.cycle_id, pos.asset,
                         pos.short_venue, pos.long_venue,
@@ -975,6 +1130,7 @@ class CrossVenueStrategy:
                         pos.units, pos.hl_entry_price, pos.lighter_entry_price,
                         pos.hl_rate_at_entry, pos.lighter_rate_at_entry,
                         pos.spread_at_entry, pos.entry_fee_usd,
+                        pos.hl_last_funding_time_ms,
                         "OPEN",
                     ),
                 )
@@ -1009,8 +1165,15 @@ class CrossVenueStrategy:
             async with get_db() as conn:
                 await conn.execute(
                     "UPDATE cross_venue_cycles SET "
-                    "hl_funding_collected=?, lighter_funding_collected=? WHERE id=?",
-                    (pos.hl_funding_collected, pos.lighter_funding_collected, pos.cycle_id),
+                    "hl_funding_collected=?, lighter_funding_collected=?, "
+                    "lighter_last_funding_id=?, hl_last_funding_time_ms=? WHERE id=?",
+                    (
+                        pos.hl_funding_collected,
+                        pos.lighter_funding_collected,
+                        pos.lighter_last_funding_id,
+                        pos.hl_last_funding_time_ms,
+                        pos.cycle_id,
+                    ),
                 )
                 await conn.commit()
         except Exception as e:
@@ -1072,6 +1235,33 @@ class CrossVenueStrategy:
 
     def _set_cooldown(self, asset: str) -> None:
         self._entry_cooldowns[asset] = int(time.time()) + CROSS_EXIT_COOLDOWN_S
+
+    async def _register_entry_fail(self, asset: str, reason: str) -> None:
+        """Count consecutive entry failures (HL timeout OR Lighter ghost) per asset.
+        After STREAK_LIMIT in a row, blacklist the asset for several hours so we
+        stop burning cover fees / busy-looping on an asset that won't fill."""
+        streak = self._entry_fail_streak.get(asset, 0) + 1
+        self._entry_fail_streak[asset] = streak
+        if streak >= self._ENTRY_FAIL_STREAK_LIMIT:
+            cooldown_s = self._ENTRY_FAIL_LONG_COOLDOWN_S
+            self._entry_fail_streak[asset] = 0  # reset after long cooldown
+            log_warn(
+                f"CrossVenue: {asset} entry-fail streak {streak}× ({reason}) — "
+                f"blacklisting {cooldown_s//3600}h to stop fee drain"
+            )
+            await self._notify(
+                f"⚠️ <b>{asset} entry failed ×{streak}</b>\n"
+                f"Last: {reason}\n"
+                f"Blacklisting {cooldown_s//3600}h — can't fill cleanly as maker."
+            )
+        else:
+            cooldown_s = CROSS_EXIT_COOLDOWN_S
+            await self._notify(
+                f"⚠️ <b>CrossVenue: {asset} entry failed</b>\n"
+                f"{reason}. Streak={streak}/{self._ENTRY_FAIL_STREAK_LIMIT}. "
+                f"Cooldown {cooldown_s}s."
+            )
+        self._entry_cooldowns[asset] = int(time.time()) + cooldown_s
 
     async def _notify(self, msg: str) -> None:
         if self._notifier:

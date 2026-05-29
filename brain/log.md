@@ -6,6 +6,50 @@
 
 ## 2026-05-28
 
+`2026-05-29 | feeds/spread_scanner.py, venues/lighter.py, strategies/cross_venue_carry.py, core/constants.py | REFACTOR ranking: PRIMARY signal теперь historical sustained spread (24h paired HL+Lighter settlements через /fundings public API + HL fundingHistory). Раз в час refresh_historical_stats() считает avg_spread × hit_ratio для всех whitelist activов. Ranking: hist score, instant используется только для direction/magnitude sanity. Старый stability_gate в _enter_position удалён (дублировал ranking). Пороги откалиброваны на живые данные: 0.025%/h → 0.005%/h (44% APR), MIN_HOLD 6h → 8h. Реалити: BCH единственный с hits>=12/24 при текущем рынке.`
+
+`2026-05-29 | core/constants.py, feeds/spread_scanner.py, venues/hyperliquid.py, strategies/cross_venue_carry.py | FEAT historical stability gate. SPREAD_ENTRY 0.015%→0.025%/h. WHITELIST 33→21 (tier-1 only). MIN_HOLD 4h→6h. COOLDOWN 5min→15min. TWAP window 15min→30min. NEW: scanner.is_stable_carry() — pulls HL fundingHistory за 24h, проверяет ≥50% часов выше threshold в нашу сторону. Защита от instant spike traps вроде NEAR (24h avg 0.0007%/h, max 0.0013%/h vs показанные 0.05%/h).`
+
+`2026-05-29 | venues/lighter.py, strategies/cross_venue_carry.py, core/models.py, database/schema.sql | FEAT BUG-034 — real Lighter settlement accounting через /positionFunding API. Заменил rate×time (завышал в 3.3×). Idempotency через lighter_last_funding_id. Restart-safe: recover_open_positions сбрасывает stale lighter_funding и перенабирает через API.`
+
+`2026-05-29 | strategies/cross_venue_carry.py | BUGFIX BUG-035 — exit_soft/flip теперь на TWAP вместо instant spread. Fallback на instant если TWAP не валиден.`
+
+`2026-05-29 | ui/dashboard.py, main_cross.py | UI: колонка "Entry spr." → "Entry/TWAP" — показывает current TWAP рядом с entry. Видно что мы фактически зарабатываем сейчас.`
+
+`2026-05-29 | database/schema.sql | ALTER cross_venue_cycles ADD lighter_last_funding_id INTEGER. Миграция применена к live DB.`
+
+`2026-05-28 | venues/hyperliquid.py | BUGFIX BUG-033 — 1000PEPE "invalid size". _get_sz_decimals кэш ключи HL names, вызов с Lighter canonical → fallback 4 decimals вместо 0 → HL reject. Fix: translate через self._hl(asset) перед lookup.`
+
+`2026-05-28 | venues/lighter.py | BUGFIX BUG-032 — repost_delay=3s < ZK settlement ~4s → ghost position checks. Fix: min(5.0, ...).`
+
+`2026-05-28 | feeds/spread_scanner.py, strategies/cross_venue_carry.py, core/constants.py | FEAT TWAP entry gate (BUG-031). _spread_history → _rate_history[(ts,hl,lt)]. Новый get_twap_spread(window_s=900). В _enter_position: 5-й фильтр — TWAP_15min ≥ SPREAD_ENTRY_THRESHOLD. Fail-closed на warmup (<10 семплов). Защита от instantaneous Lighter rate spike при фактически низком settlement TWAP.`
+
+`2026-05-28 | core/constants.py | CROSS_MAX_POSITIONS: 3 → 1. Строго 1 монета одновременно.`
+
+`2026-05-28 | strategies/cross_venue_carry.py | BUGFIX: scanner запрашивал ровно n=1 кандидата при MAX=1. Если топ-кандидат в кулдауне → тик пустой, #2/#3 не пробовались. Fix: запрашиваем n_slots + max(5, len(cooldowns)) кандидатов — с запасом для обхода кулдаунов.`
+
+`2026-05-28 | strategies/cross_venue_carry.py | BUGFIX BUG-030 — одновременное открытие двух монет. tick() считал open_count один раз и затем в for-loop открывал ALL n=(MAX-open_count) кандидатов подряд без перепроверки. Fix: после каждого _enter_position пересчитываем new_count; если new_count > open_count — break. Теперь максимум 1 новая позиция за тик.`
+
+`2026-05-28 | venues/lighter.py, strategies/cross_venue_carry.py | BUGFIX BUG-029 — дублирующий вход в WLD после рестарта. get_position_for_asset() глотает исключения → lt_size=0.0 при падении Lighter API → PARTIAL branch → HL нога закрыта тейкером + DB=ABANDONED → re-entry. Fix: новый метод get_position_size_or_raise() пробрасывает исключения; recover_open_positions() переключён на него.`
+
+---
+
+`2026-05-28 19:25 | venues/lighter.py | BUGFIX BUG-027 — Lighter maker_chase двойные/множественные заполнения (double-fill). Root cause: ZK rollup имеет задержку оседания ~3-4с. cancel_order проверяет order_book_orders: если ордер ещё в mempool (не виден в книге) → возвращал True с "no resting order found". maker_chase интерпретировал это как успешную отмену и делал ещё один ордер → все ордера в итоге оседали, позиция умножалась (7× NEAR). Fix: cancel_order теперь возвращает None (а не True) если ордер не найден в книге. maker_chase: если cancelled is None → sleep 2s (дать цепи осесть) → повторная проверка позиции → если вырос → FILLED; иначе — продолжить следующую попытку.`
+
+`2026-05-28 19:25 | venues/hyperliquid.py | FEAT fast-fail makers. HL maker_chase_entry: (1) "immediately matched" 3× подряд → abort (рынок слишком волатильный для maker); (2) empty book 3× подряд → abort. Предотвращает трату 30с на заведомо неисполнимые maker-ордера.`
+
+`2026-05-28 19:25 | strategies/cross_venue_carry.py | BUGFIX BUG-028 — recover_open_positions: Lighter lt_size читался через key "base_amount" но реальный ключ API — "size". → lt_size всегда 0 → PARTIAL path вместо RESTORE. Fix: проверяем оба ключа: size || base_amount. Параллельно: place_taker() требует price — добавлен lookup mid-price из L2 book перед taker-close в recovery.`
+
+`2026-05-28 18:50 | venues/hyperliquid.py | BUGFIX BUG-025 — KeyError '1000PEPE' в l2_snapshot. name_to_coin заполняется один раз при init SDK, но meta_and_asset_ctxs() возвращает свежие данные включая новые листинги. Fix: (1) в get_funding_rates — дополняем name_to_coin для каждого актива в свежем universe; (2) в get_l2_book — fallback на прямой POST если KeyError.`
+
+`2026-05-28 18:40 | venues/lighter.py | BUGFIX BUG-023 — cancel_all_orders(CANCEL_ALL_TIF_IMMEDIATE) отклоняется сервером с "CancelAllTime should be nil". SDK binary устанавливает cancel_all_time в non-nil значение даже для IMMEDIATE режима. Новый подход: query order_book_orders(market_index, 100) → находим ордер по owner_account_index == account_index → cancel_order(market_index, order_index).`
+
+`2026-05-28 18:40 | strategies/cross_venue_carry.py | BUGFIX BUG-024 — "cannot determine price for 1000PEPE" когда snap.hl_mark_px=0 (актив попал в common_assets через hl_via_lighter, а не через прямые HL данные). Добавлен fallback 2: Lighter mid price из lt_bid/lt_ask которые уже есть в scope из book spread check.`
+
+`2026-05-28 18:15 | core/constants.py | TUNING — снижены пороги для активного фарминга: SPREAD_ENTRY_THRESHOLD 0.030%/h → 0.015%/h (131% APR, реальный NEAR-цикл 108% был выгоден); SPREAD_EXIT_THRESHOLD 0.010%/h → 0.005%/h; SPIKE_HISTORY_MIN_SAMPLES 12 → 5 (warmup 5 мин вместо 12); SPIKE_SIGMA_THRESHOLD 2.0 → 2.5 (меньше ложных отклонений); SPREAD_SCAN_INTERVAL_S 60 → 30 (вдвое быстрее ловит окна); CROSS_MAX_POSITIONS 1 → 3 (диверсификация, 3×$25×2=$150 из $200 = 75% deployed).`
+
+
+
 `2026-05-28 16:10 | feeds/spread_scanner.py + strategies/cross_venue_carry.py | BUGFIX BUG-022 — spike filter fail-open на холодном старте. is_spike() возвращал (False, "insufficient_history") при <12 сэмплах → бот входил в NEAR при Lighter rate ~0.091%/h (~800% APR), ставка нормализовалась до 0.013%/h за 1 час. Реальный APR ~108% вместо ожидаемых 800%. Fix: is_spike() теперь fail-closed — возвращает (True, "warming_up") пока история не накоплена. Стратегия: при "warming_up" — не ставит cooldown, просто ждёт следующий тик.`
 
 `2026-05-28 15:35 | strategies/cross_venue_carry.py | BUGFIX BUG-020 — HL funding учитывался с обратным знаком в poll_hl_funding_rest. HL cumFunding.sinceOpen использует COST convention (positive = paid), а наш hl_funding_collected — P&L convention (positive = earned). Старый код: hl_funding_collected = since_open → знак инвертирован И WS-события (которые были корректные) перезаписывались. Подтверждение: NEAR Long, реальный userFunding usdc=-0.000307 (платили), но cumFunding.sinceOpen вернул бы +0.000307. Fix: earned_total = -since_open.`
@@ -103,3 +147,7 @@
 `2026-05-04 | strategies/funding_carry.py + main.py + schema.sql | BUG-017 FIX — WS userFundings replay при каждом reconnect дублировал записи. Введён 3-уровневый dedup: (1) in-memory _seen_fundings set по (asset, paid_at_ms); (2) UNIQUE INDEX uq_payments_asset_time + INSERT OR IGNORE — атомарно блокирует cross-session дубли; (3) temporal guard — игнорировать events с paid_at < pos.entered_at*1000. paid_at теперь в миллисекундах из HL события (не int(time.time())).`
 
 `2026-05-04 | core/constants.py | PROD-BETA TUNING — FUNDING_ENTRY_THRESHOLD 0.00001→0.00025 (0.001%/h→0.025%/h). MIN_HOLD 1→8h, MAX_HOLD 4→48h. POSITION_SIZE_USD 20→300. ACTIVE_CAPITAL 50→500. FUNDING_EXIT_SOFT 0.000005→0.0001. FUNDING_HOLD_MIN 0.000005→0.0001. Цель: +EV в худшем сценарии (taker spot entry) за 6h hold.`
+
+`2026-05-29 | venues/lighter.py + strategies/cross_venue_carry.py | BUG-036 FIX — Lighter maker side inverted (buy@ask/sell@bid = POST_ONLY reject = ghost). Исправлено на buy@bid/sell@ask. + HL taker fallback при maker-timeout. + единый _entry_fail_streak (HL timeout ИЛИ Lighter ghost), 3 подряд → 4ч blacklist. Корень всех legging-cover потерь на BCH/NEAR/TAO.`
+
+`2026-05-30 | venues/hyperliquid.py + strategies/cross_venue_carry.py + core/models.py + schema.sql | BUG-038 FIX — HL funding: заменён cumFunding.sinceOpen (сбрасывается при закрытии ноги) на userFunding REST API (реальные USD-суммы, idempotent по time_ms). BUG-039 FIX — recovery orphan close: lt_is_buy=long_v→short_v (SELL вместо BUY удваивал Lighter short).`

@@ -38,11 +38,12 @@ class TelegramNotifier:
         except Exception as e:
             crash_log("telegram.send_alert", e)
 
-    async def send_report(self, stats) -> None:
+    async def send_report(self, stats, *, final: bool = False) -> None:
         from core.models import SessionStats
         s: SessionStats = stats
+        title = "🔴 <b>Session Ended</b>" if final else "📊 <b>Periodic Report</b>"
         msg = (
-            f"📊 <b>HL Carry Report</b>\n"
+            f"{title}\n"
             f"Cycles: {s.total_cycles} (ok: {s.successful_cycles})\n"
             f"Funding: ${s.total_funding_usd:+.4f}\n"
             f"Fees: ${s.total_fees_usd:.4f}\n"

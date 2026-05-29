@@ -85,6 +85,12 @@ class LighterClient:
     async def close(self) -> None:
         if self._session and not self._session.closed:
             await self._session.close()
+        # Close Lighter SDK's internal ApiClient (has its own aiohttp session)
+        if self._signer is not None:
+            try:
+                await self._signer.close()
+            except Exception:
+                pass
 
     # ── Market metadata ───────────────────────────────────────────────────────
 
@@ -153,6 +159,94 @@ class LighterClient:
         except Exception as e:
             crash_log("LighterClient.get_funding_rates", e)
             return {}
+
+    async def get_funding_history(
+        self, asset: str, hours: int = 24
+    ) -> List[Dict]:
+        """
+        Public historical hourly funding rates for an asset on Lighter.
+        Returns [{timestamp, rate, value, direction}, ...] sorted by ts ascending.
+        `rate` is in percent per hour (0.0054 = 0.0054%/h).
+
+        No authentication required. Used by SpreadScanner to score assets by
+        sustained carry rather than instant spikes.
+        """
+        try:
+            import time as _t
+            await self._ensure_markets()
+            mid = self.market_id(asset)
+            if mid is None:
+                return []
+            end_ms = int(_t.time() * 1000)
+            start_ms = end_ms - hours * 3600 * 1000
+            path = (
+                f"/fundings?market_id={mid}&resolution=1h"
+                f"&start_timestamp={start_ms}&end_timestamp={end_ms}&count_back={hours+5}"
+            )
+            data = await self._get(path)
+            out: List[Dict] = []
+            for f in data.get("fundings", []):
+                out.append({
+                    "timestamp":  int(f.get("timestamp", 0)),
+                    "rate":       float(f.get("rate", 0)) / 100.0,  # convert %/h → decimal
+                    "value_usd":  float(f.get("value", 0)),
+                    "direction":  str(f.get("direction", "")),
+                })
+            out.sort(key=lambda r: r["timestamp"])
+            return out
+        except Exception as e:
+            crash_log(f"LighterClient.get_funding_history.{asset}", e)
+            return []
+
+    async def get_position_fundings(
+        self, asset: str, since_ts: int = 0, limit: int = 100
+    ) -> List[Dict]:
+        """
+        Real settled funding payments for our account on this asset.
+        Returns list of dicts: [{funding_id, timestamp, change_usd, rate, side}, ...]
+        sorted by timestamp ascending (oldest first).
+
+        Authenticated endpoint — requires SignerClient (loaded via _init_signer).
+        Replaces the inaccurate rate×time accounting: settlements are TWAP-based,
+        we now read the actual USDC amounts the exchange credited to us.
+        """
+        try:
+            import lighter as _lighter_sdk
+            self._init_signer()
+            await self._ensure_markets()
+            mid = self.market_id(asset)
+            if mid is None:
+                return []
+            auth_token, err = self._signer.create_auth_token_with_expiry(
+                self._signer.DEFAULT_10_MIN_AUTH_EXPIRY
+            )
+            if err:
+                log_warn(f"LighterClient.get_position_fundings: auth gen failed: {err}")
+                return []
+            account_api = _lighter_sdk.AccountApi(self._signer.api_client)
+            resp = await account_api.position_funding(
+                account_index=self._account_index,
+                market_id=mid,
+                limit=limit,
+                authorization=auth_token,
+            )
+            out: List[Dict] = []
+            for pf in (resp.position_fundings or []):
+                ts = int(pf.timestamp)
+                if ts < since_ts:
+                    continue
+                out.append({
+                    "funding_id":  int(pf.funding_id),
+                    "timestamp":   ts,
+                    "change_usd":  float(pf.change),
+                    "rate":        float(pf.rate),
+                    "side":        str(pf.position_side),
+                })
+            out.sort(key=lambda r: r["timestamp"])
+            return out
+        except Exception as e:
+            crash_log(f"LighterClient.get_position_fundings.{asset}", e)
+            return []
 
     async def get_all_exchange_funding_rates(self) -> Dict[str, Dict[str, float]]:
         """
@@ -283,6 +377,25 @@ class LighterClient:
         except Exception as e:
             crash_log(f"LighterClient.get_position_for_asset.{asset}", e)
             return None
+
+    async def get_position_size_or_raise(self, asset: str) -> float:
+        """
+        Return absolute position size for asset; raises on any API error.
+        Use this in recovery paths where None vs 0.0 ambiguity is dangerous.
+        """
+        await self._ensure_markets()
+        mid = self.market_id(asset)
+        if mid is None:
+            return 0.0
+        param = (
+            str(self._account_index)
+            if self._account_index is not None
+            else self._address
+        )
+        data = await self._get_explorer(f"/accounts/{param}/positions")
+        positions = data.get("positions", {})
+        lt_d = positions.get(str(mid)) or {}
+        return abs(float(lt_d.get("size", 0) or lt_d.get("base_amount", 0) or 0))
 
     # ── SDK initialisation ────────────────────────────────────────────────────
 
@@ -435,26 +548,41 @@ class LighterClient:
 
     async def cancel_order(self, asset: str, order_id: str) -> bool:
         """
-        Cancel all open orders via SDK cancel_all_orders (IMMEDIATE).
+        Cancel our resting order on this asset by looking it up in the order book.
 
-        Why cancel_all instead of cancel_order:
-          GET /orders endpoint requires REST auth we don't pass, so we cannot
-          look up the book-level order_index needed by cancel_order(order_index=...).
-          cancel_all_orders is a single SDK tx that reliably purges all resting
-          orders — safe for our bot because we run one position at a time.
+        Strategy: query order_book_orders for the market, find the entry owned by
+        our account_index, and cancel it via signer.cancel_order(market_index, order_index).
+
+        cancel_all_orders(CANCEL_ALL_TIF_IMMEDIATE) rejected by server with
+        "CancelAllTime should be nil" — API no longer accepts that call for immediate
+        cancellation (BUG-023 2026-05-28).
         """
         self._init_signer()
+        await self._ensure_markets()
+        market_index = self.market_id(asset)
+        if market_index is None:
+            log_warn(f"LighterClient.cancel_order: unknown market {asset}")
+            return False
         try:
-            # CANCEL_ALL_TIF_IMMEDIATE = 0 — SDK ctypes binding requires an int, None crashes.
-            # Previous comment claiming None was required was wrong (was a server-error misread).
-            _, resp, error = await self._signer.cancel_all_orders(
-                time_in_force=self._signer.CANCEL_ALL_TIF_IMMEDIATE,
-                timestamp_ms=int(time.time() * 1000),
-            )
+            ob = await self._signer.order_api.order_book_orders(market_index, 100)
+            our_order_index: Optional[int] = None
+            for side in [ob.bids, ob.asks]:
+                for o in side:
+                    if o.owner_account_index == self._account_index:
+                        our_order_index = o.order_index
+                        break
+                if our_order_index is not None:
+                    break
+
+            if our_order_index is None:
+                log(f"LighterClient.cancel_order: {asset} no resting order found (already filled)")
+                return None  # None = not found; may be filled or still pending settlement
+
+            _, _, error = await self._signer.cancel_order(market_index, our_order_index)
             if error:
-                log_warn(f"LighterClient.cancel_order: {asset} cancel_all error: {error}")
+                log_warn(f"LighterClient.cancel_order: {asset} cancel error: {error}")
                 return False
-            log(f"LighterClient: cancel_all_orders OK (triggered by {asset} repost)")
+            log(f"LighterClient: cancel_order OK {asset} order_index={our_order_index}")
             return True
         except Exception as e:
             crash_log(f"LighterClient.cancel_order.{asset}", e)
@@ -492,7 +620,9 @@ class LighterClient:
         """
         await self._ensure_markets()
         start = time.monotonic()
-        repost_delay = timeout_s / max(max_reposts, 1)
+        # ZK rollup needs ~3-4s to settle a transaction on-chain; we must wait
+        # at least that long before checking position or the fill won't be visible.
+        repost_delay = max(5.0, timeout_s / max(max_reposts, 1))
         label_str = f"[{label}] " if label else ""
 
         # Snapshot size BEFORE we place anything — needed for close-fill detection.
@@ -521,7 +651,12 @@ class LighterClient:
                 await asyncio.sleep(2.0)
                 continue
 
-            price = ask if is_buy else bid
+            # Maker must rest on the PASSIVE side or POST_ONLY rejects on-chain:
+            # a buy joins the bid, a sell joins the ask. Placing a buy at the ask
+            # (or sell at the bid) is marketable → POST_ONLY killed → "ghost" (no
+            # resting order, no fill). This was BUG-036: side was inverted, causing
+            # near-100% reject on tight-spread liquid assets (BCH/NEAR/TAO).
+            price = bid if is_buy else ask
             order_id = await self.place_maker(asset, is_buy, size, price, reduce_only=reduce_only)
             if order_id is None:
                 log_warn(f"LighterClient.maker_chase: {label_str}{asset} place_maker failed (attempt {attempt+1})")
@@ -556,12 +691,28 @@ class LighterClient:
             # IMPORTANT: if cancel fails, abort immediately — continuing would place
             # a new order on top of the unfilled one, accumulating orphaned orders.
             cancelled = await self.cancel_order(asset, order_id)
-            if not cancelled:
+            if cancelled is False:
                 log_warn(
                     f"LighterClient.maker_chase: {label_str}{asset} "
                     f"cancel failed at attempt {attempt+1} — aborting to prevent order accumulation"
                 )
                 return None
+            if cancelled is None:
+                # Order not found on book — could be (a) filled but position not yet settled on-chain,
+                # or (b) order still pending in ZK rollup mempool. Wait 2s for state to propagate.
+                await asyncio.sleep(2.0)
+                pos2 = await self.get_position_for_asset(asset)
+                if pos2 is not None:
+                    sz2 = abs(float(pos2.get("size", 0) or pos2.get("base_amount", 0)))
+                    if closing:
+                        if (pre_size - sz2) >= size * 0.9:
+                            log(f"LighterClient.maker_chase: {label_str}{asset} CLOSE FILLED (post-cancel lag @ {price})")
+                            return order_id
+                    else:
+                        if (sz2 - pre_size) >= size * 0.9:
+                            log(f"LighterClient.maker_chase: {label_str}{asset} FILLED (post-cancel lag @ {price})")
+                            return order_id
+                # Still not visible — order was likely pending (not filled), safe to repost.
 
         log_warn(f"LighterClient.maker_chase: {label_str}{asset} exhausted {max_reposts} reposts")
         # Final cleanup cancel — make sure nothing lingers on the book.
