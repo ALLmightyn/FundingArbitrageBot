@@ -86,8 +86,10 @@ sqlite3 database/carry.db "SELECT asset, round((strftime('%s','now')-entered_at)
 2. Spike filter: 5 семплов warmup, σ-gate 2.5σ
 3. TWAP gate: 20 семплов / 30 мин — fail-closed
 4. HL leg: maker_chase_entry → при таймауте taker fallback (HL IOC)
-5. Lighter leg: maker_chase_entry @ **bid if buy / ask if sell** (BUG-036 был: инверсия → POST_ONLY реджект → ghost)
-6. Таймаут Lighter: 90s (3 подряд провала любой ноги → 4ч blacklist через `_entry_fail_streak`)
+5. Lighter leg: maker_chase_entry **15s** (`LT_ENTRY_MAKER_TIMEOUT_S`) @ bid/ask (BUG-036 исправлен)
+   → если не заполнено: **taker IOC** (Lighter taker = 0% fee) + 2× ZK-settle check (5s+5s)
+   → если всё равно None: 6s ZK-lag guard → проверяем позицию — только потом `_cover_naked_hl_leg`
+6. 3 подряд провала (HL leg unfillable / Lighter genuinely failed) → 4h blacklist через `_entry_fail_streak`
 
 ### Выход
 - `spread_flip` (TWAP ≤ EXIT_FLIP): **taker** немедленно

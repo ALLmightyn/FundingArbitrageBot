@@ -1,6 +1,6 @@
 ---
 Type: Bug Graveyard (append-only)
-Updated: 2026-05-04
+Updated: 2026-05-30
 ---
 
 # Bug Graveyard — HLCarryBot
@@ -201,3 +201,13 @@ Full e2e testing requires mainnet. On testnet bot correctly skips all assets and
 - Cause: `lt_is_buy = (long_v == "lighter")` in partial-recovery close logic. For short_venue="lighter" this evaluates to False → places SELL (adds to short) instead of BUY (closes short).
 - Fix: `lt_is_buy = (short_v == "lighter")` — if Lighter was the short leg, we BUY to close; if Lighter was the long leg, we SELL to close.
 - File: `strategies/cross_venue_carry.py:recover_open_positions` partial-close block
+
+**BUG-040** Lighter-нога 90s maker-only → timeout → HL cover тейкером → 4h blacklist лучшего актива.
+- Cause: `LT_ENTRY_TIMEOUT_S=90s` давал 9 maker-репостов без taker-fallback. BCH: каждый раз заполняла HL-нога, Lighter зависала (тонкий ask), через 100s → cover HL тейкером ($0.003 loss) + `_register_entry_fail`. 3 фейла → 4h blacklist (01:32:55). Потеряли всё вечернее окно BCH (hits 19/24, 0.0079%/h).
+- Fix: `LT_ENTRY_MAKER_TIMEOUT_S=15s` + немедленный taker IOC fallback. Lighter taker = 0% fee → нет пенальти. 2 ZK-settle check (5s+5s) перед подтверждением fill.
+- File: `strategies/cross_venue_carry.py:_enter_position` Step 2; `core/constants.py:LT_ENTRY_MAKER_TIMEOUT_S`
+
+**BUG-041** ZK-lag orphan: `maker_chase` timeout → cover HL → Lighter order приземляется через 3-4s → Lighter short без HL-хеджа (PARTIAL HL=0.029 LT=0.083 при рестарте 00:44).
+- Cause: `maker_chase_entry` возвращает None после timeout; стратегия сразу вызывает `_cover_naked_hl_leg`, но ZK-rollup ещё не смаркировал fill в state. Recovery правильно закрывал orphan, но это delta-риск + лишние fees.
+- Fix: после всех maker/taker попыток — 6s final ZK-lag guard: проверяем `get_position_for_asset`. Если size ≥ 90% target → `zk_lag_fill`, НЕ крываем HL.
+- File: `strategies/cross_venue_carry.py:_enter_position` ZK-lag guard block (после lt_order_id is None)

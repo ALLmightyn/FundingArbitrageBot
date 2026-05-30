@@ -4,6 +4,12 @@
 
 ---
 
+## 2026-05-30
+
+`2026-05-30 | strategies/cross_venue_carry.py, core/constants.py | BUGFIX BUG-040+041 — Lighter-нога: maker 90s → taker IOC fallback (0% fee). Добавлен LT_ENTRY_MAKER_TIMEOUT_S=15s. После 15s maker → place_taker IOC + 2× ZK-settle check (5s+5s). Финальный 6s ZK-lag guard перед _cover_naked_hl_leg предотвращает orphan Lighter short. Устраняет цепочку: timeout → HL cover fee → entry_fail_streak → 4h blacklist лучшего актива.`
+
+---
+
 ## 2026-05-28
 
 `2026-05-29 | feeds/spread_scanner.py, venues/lighter.py, strategies/cross_venue_carry.py, core/constants.py | REFACTOR ranking: PRIMARY signal теперь historical sustained spread (24h paired HL+Lighter settlements через /fundings public API + HL fundingHistory). Раз в час refresh_historical_stats() считает avg_spread × hit_ratio для всех whitelist activов. Ranking: hist score, instant используется только для direction/magnitude sanity. Старый stability_gate в _enter_position удалён (дублировал ranking). Пороги откалиброваны на живые данные: 0.025%/h → 0.005%/h (44% APR), MIN_HOLD 6h → 8h. Реалити: BCH единственный с hits>=12/24 при текущем рынке.`

@@ -45,6 +45,7 @@ from core.constants import (
     CROSS_EXIT_COOLDOWN_S,
     MAKER_CHASE_TIMEOUT_S,
     LT_ENTRY_TIMEOUT_S,
+    LT_ENTRY_MAKER_TIMEOUT_S,
     FEE_CROSS_ROUND_TRIP,
     FEE_PERP_MAKER,
     FEE_PERP_TAKER,
@@ -577,23 +578,74 @@ class CrossVenueStrategy:
         log(f"CrossVenue: {asset} HL leg filled @ {pos.hl_entry_price:.6f} — now opening Lighter leg")
 
         # ── Step 2: Open Lighter leg ──────────────────────────────────────────
-        # Use a longer timeout than the cover leg: HL is already hedged so waiting
-        # 90s is safe and gives the maker order time to fill on a slow market.
+        # Lighter taker fee = 0%, so: short maker window (15s) → taker IOC fallback.
+        # Old 90s pure-maker loop was burning HL cover fees + triggering 4h blacklist.
         lt_label = f"Lighter {'short' if not lt_is_buy else 'long'}"
         lt_order_id = await self._lt.maker_chase_entry(
             asset=asset,
             is_buy=lt_is_buy,
             size=units,
             label=lt_label,
-            timeout_s=LT_ENTRY_TIMEOUT_S,
+            timeout_s=LT_ENTRY_MAKER_TIMEOUT_S,
         )
 
+        lt_via_taker = False
         if lt_order_id is None:
-            log_warn(f"CrossVenue: {asset} Lighter leg failed — covering HL leg")
-            await self._cover_naked_hl_leg(asset, pos)
-            del self.positions[asset]
-            await self._register_entry_fail(asset, "Lighter ghost — HL leg covered")
-            return
+            # Maker didn't fill in 15s → taker IOC (0% fee on Lighter, no penalty).
+            log_warn(f"CrossVenue: {asset} Lighter maker timed out — taker fallback (0% fee)")
+            try:
+                lt_bid_now, lt_ask_now = await self._lt.get_best_prices(asset)
+                lt_taker_px = lt_ask_now * 1.001 if lt_is_buy else lt_bid_now * 0.999
+                lt_order_id = await self._lt.place_taker(
+                    asset, is_buy=lt_is_buy, size=units, price=lt_taker_px
+                )
+                if lt_order_id:
+                    await asyncio.sleep(5.0)  # ZK settlement: ~3-4s to appear on-chain
+                    lt_pos_check = await self._lt.get_position_for_asset(asset)
+                    sz_check = abs(float(
+                        (lt_pos_check or {}).get("size", 0)
+                        or (lt_pos_check or {}).get("base_amount", 0) or 0
+                    ))
+                    if sz_check >= units * 0.9:
+                        lt_via_taker = True
+                        log(f"CrossVenue: {asset} Lighter taker fill confirmed sz={sz_check:.6f}")
+                    else:
+                        # One more ZK cycle
+                        await asyncio.sleep(5.0)
+                        lt_pos_check2 = await self._lt.get_position_for_asset(asset)
+                        sz_check2 = abs(float(
+                            (lt_pos_check2 or {}).get("size", 0)
+                            or (lt_pos_check2 or {}).get("base_amount", 0) or 0
+                        ))
+                        if sz_check2 >= units * 0.9:
+                            lt_via_taker = True
+                            log(f"CrossVenue: {asset} Lighter taker fill confirmed (2nd ZK check) sz={sz_check2:.6f}")
+                        else:
+                            lt_order_id = None
+            except Exception as e:
+                crash_log(f"CrossVenue.lt_taker_fallback.{asset}", e)
+                lt_order_id = None
+
+        if lt_order_id is None:
+            # ZK-lag guard: maker_chase may have timed out while the last order was
+            # still in ZK mempool. Wait one settlement window before covering HL —
+            # covering prematurely creates an orphan Lighter short (root of PARTIAL bug).
+            await asyncio.sleep(6.0)
+            lt_pos_final = await self._lt.get_position_for_asset(asset)
+            sz_final = abs(float(
+                (lt_pos_final or {}).get("size", 0)
+                or (lt_pos_final or {}).get("base_amount", 0) or 0
+            ))
+            if sz_final >= units * 0.9:
+                lt_via_taker = True
+                lt_order_id = "zk_lag_fill"
+                log(f"CrossVenue: {asset} Lighter ZK-lag fill detected sz={sz_final:.6f} — no cover needed")
+            else:
+                log_warn(f"CrossVenue: {asset} Lighter leg failed — covering HL leg")
+                await self._cover_naked_hl_leg(asset, pos)
+                del self.positions[asset]
+                await self._register_entry_fail(asset, "Lighter ghost — HL leg covered")
+                return
 
         # ── Both legs filled ──────────────────────────────────────────────────
         # Get actual Lighter fill price from live position data (entry_price is the

@@ -60,6 +60,7 @@ MAKER_CHASE_REPOST_DELAY_S: float = 2.0  # Seconds between repost checks
 MAKER_CHASE_TIMEOUT_S: float = 30.0      # Total time before taker fallback on cover leg
 MAKER_EXIT_TIMEOUT_S: float = 120.0      # Total time for maker exit before taker fallback
 LT_ENTRY_TIMEOUT_S: float = 90.0        # Lighter entry leg: longer wait since HL is hedged
+LT_ENTRY_MAKER_TIMEOUT_S: float = 15.0  # Maker window before taker fallback (Lighter taker = 0%)
 SPOT_TAKER_FALLBACK_S: float = 20.0      # Spot maker timeout before emergency taker buy (naked short prevention)
 
 # ── Funding scanner ──────────────────────────────────────────────────────────
