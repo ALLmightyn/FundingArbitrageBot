@@ -180,14 +180,29 @@ HL_TO_LIGHTER_SYMBOL: dict = {v: k for k, v in LIGHTER_TO_HL_SYMBOL.items()}
 # Note: MAX_LIGHTER_BOOK_SPREAD_PCT is a second-line filter for thin books.
 # Whitelist catches assets without reliable Lighter markets entirely.
 CROSS_VENUE_WHITELIST: set = {
-    # Tier 1: large-caps with deep books and stable funding history.
-    # Per podcast wisdom: stick to "большие монеты с минимальными спредами".
-    # Smaller / new assets see manipulation and funding spikes that revert before
-    # settlement, eating fees. The historical stability check still gates entries,
-    # but a smaller whitelist saves scanner time and reduces accidental exposure.
+    # Verified 2026-06-02: all assets present on BOTH HL + Lighter with maxLeverage ≥ 5x
+    # and OI > $1M on HL (liquidity filter). The scanner's 24h historical stability filter
+    # + TWAP gate + sigma-spike filter protect against illiquid/spike entries — no need
+    # to manually restrict. Expanding from 21 → 73 assets gives the scanner ~3.5× more
+    # opportunities to find sustained carry. MAX_LIGHTER_BOOK_SPREAD_PCT (0.3%) is the
+    # runtime thin-book guard; the whitelist is now just an "exists on both venues" list.
+
+    # Original tier-1 (all 10x on HL):
     "BTC", "ETH", "SOL", "BNB", "XRP", "DOGE", "ADA", "AVAX",
     "LINK", "DOT", "AAVE", "BCH", "LTC", "ATOM", "UNI", "SUI",
     "ARB", "OP", "APT", "TAO", "NEAR",
+
+    # New tier-2 — 10x on HL, OI > $1M (highly liquid):
+    "HYPE", "ZEC", "TON", "PUMP", "WLD", "PAXG", "FARTCOIN",
+    "1000PEPE", "ENA", "ONDO", "TRX", "JUP", "TRUMP", "CRV",
+    "1000BONK", "1000SHIB", "DYDX", "XPL",
+
+    # New tier-3 — 5x on HL, OI > $2M (liquid enough):
+    "LIT", "ASTER", "XMR", "MON", "ZRO", "WLFI", "PENDLE", "LDO",
+    "VIRTUAL", "HBAR", "ICP", "EIGEN", "MNT", "WIF", "MORPHO",
+    "ETHFI", "TIA", "STRK", "FIL", "POL", "SPX", "SEI", "BERA",
+    "ZK", "PYTH", "KAITO", "AVNT", "1000FLOKI", "AXS",  # DUSK removed: HL 500 on funding_history
+    "XLM",
 }
 
 # Scan interval for cross-venue spread scanner

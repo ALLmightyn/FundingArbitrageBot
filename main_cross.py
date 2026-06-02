@@ -195,12 +195,18 @@ async def carry_loop() -> None:
         channel = msg.get("channel", "")
         data    = msg.get("data", {})
         if channel == "userFundings":
+            # BUG-042: HL replays the full funding history on every (re)connect as an
+            # isSnapshot frame. Skip it — the REST poll already owns history idempotently.
+            # Only live incremental events are credited (and record_hl_funding dedups by time).
+            if isinstance(data, dict) and data.get("isSnapshot"):
+                return
             fundings = data.get("fundings", []) if isinstance(data, dict) else []
             for f in fundings:
                 asset  = f.get("coin", "")
                 amount = float(f.get("usdc", 0))
+                t_ms   = int(f.get("time", 0) or 0)
                 if asset and amount != 0:
-                    await strategy.record_hl_funding(asset, amount)
+                    await strategy.record_hl_funding(asset, amount, t_ms)
 
     # HL WebSocket is optional — can be disabled in .env if network blocks WS.
     # Without WS, funding payments are NOT tracked in real-time but the bot
@@ -288,6 +294,12 @@ async def carry_loop() -> None:
                     await strategy.check_position_drift()
                 except Exception as e:
                     crash_log("carry_loop.drift_check", e, traceback.format_exc())
+                # P0: exchange-truth sweep — flatten orphans not tied to any cycle.
+                # Runs on the same cadence as the drift check (right after it).
+                try:
+                    await strategy.reconcile_orphans()
+                except Exception as e:
+                    crash_log("carry_loop.reconcile_orphans", e, traceback.format_exc())
                 last_drift_check = now
 
             # ── Refresh dashboard balances & opportunities ────────────────────

@@ -124,6 +124,23 @@ class CrossVenueStrategy:
         self._ENTRY_FAIL_STREAK_LIMIT = 3        # 3 fails → 4h blacklist
         self._ENTRY_FAIL_LONG_COOLDOWN_S = 14400 # 4 hours
 
+        # Suppress repeated TG drift alerts for the same asset (fire once per interval)
+        self._last_drift_alert: Dict[str, float] = {}
+        self._DRIFT_ALERT_COOLDOWN_S = 1800  # 30 min
+
+        # ── Exchange-truth reconciliation (P0) ────────────────────────────────
+        # The drift check only sees positions in self.positions. Once a cycle is
+        # ABANDONED/CLOSED it leaves tracking and any residual exchange leg becomes
+        # an INVISIBLE orphan (ADA dup, XLM ghosts that had to be closed by hand).
+        # reconcile_orphans() sweeps BOTH venues as source of truth. Debounced:
+        # an untracked leg must be seen on 2 consecutive sweeps before we flatten,
+        # so a transient/partial API read can never trigger a wrong close.
+        self._orphan_strikes: Dict[str, int] = {}
+        self._ORPHAN_STRIKE_LIMIT = 2
+        # Gate: the sweep must not run until startup recovery has finished, else a
+        # position that is ours but not yet restored to self.positions looks orphan.
+        self._recovery_done: bool = False
+
     # ── State recovery on restart ─────────────────────────────────────────────
 
     async def recover_open_positions(self) -> None:
@@ -141,6 +158,16 @@ class CrossVenueStrategy:
         """
         import aiosqlite as _aiosqlite
 
+        # P2/P3: cancel any resting orders on HL BEFORE snapshotting positions.
+        # The orphan we hit was born from a resting maker close-order that filled
+        # *after* recovery had already snapshotted the leg as present. Clearing the
+        # book first guarantees the position read below reflects a settled state.
+        try:
+            await self._cancel_all_resting_orders()
+            await asyncio.sleep(1.0)  # let cancels settle before reading positions
+        except Exception as e:
+            crash_log("CrossVenue.recover.cancel_resting", e)
+
         try:
             async with get_db() as conn:
                 conn.row_factory = _aiosqlite.Row
@@ -150,10 +177,12 @@ class CrossVenueStrategy:
                 rows = await cur.fetchall()
         except Exception as e:
             crash_log("CrossVenue.recover_open_positions.db_read", e)
+            self._recovery_done = True
             return
 
         if not rows:
             log("CrossVenue.recover: no OPEN DB cycles — starting fresh")
+            self._recovery_done = True
             return
 
         log(f"CrossVenue.recover: found {len(rows)} OPEN cycle(s) in DB — checking exchange")
@@ -304,6 +333,8 @@ class CrossVenueStrategy:
                         (now, cycle_id)
                     )
                     await c2.commit()
+
+        self._recovery_done = True
 
     # ── Main tick ─────────────────────────────────────────────────────────────
 
@@ -494,6 +525,26 @@ class CrossVenueStrategy:
             return
 
         units = CROSS_POSITION_SIZE_USD / mark_price
+
+        # 6. Duplicate-open guard (P1): never open if a position for this asset already
+        # exists on EITHER venue. Catches the failure that produced the 2× ADA cycles
+        # (two opens within 2 min): a residual/just-opened leg must block a second entry.
+        # Fail-closed — if we cannot confirm both venues are flat, we skip.
+        try:
+            hl_existing = await self._hl.get_perp_position_size(asset)
+            lt_existing = await self._lt.get_position_size_or_raise(asset)
+        except Exception as e:
+            log_warn(f"CrossVenue: {asset} pre-entry position check failed ({e}) — skipping")
+            return
+        dust = max(units * 0.05, 0.0005)
+        if hl_existing > dust or lt_existing > dust:
+            log_warn(
+                f"CrossVenue: {asset} ABORT entry — existing position "
+                f"(HL={hl_existing:.6f} LT={lt_existing:.6f}). Possible orphan/duplicate; "
+                f"reconcile sweep will handle it."
+            )
+            self._set_cooldown(asset)
+            return
 
         pos = CrossVenuePosition(
             asset=asset,
@@ -1053,13 +1104,25 @@ class CrossVenueStrategy:
 
     # ── Funding payment accounting ────────────────────────────────────────────
 
-    async def record_hl_funding(self, asset: str, amount: float) -> None:
-        """Called by WS handler for HL userFundings events."""
+    async def record_hl_funding(self, asset: str, amount: float, time_ms: int = 0) -> None:
+        """Called by WS handler for HL userFundings events.
+
+        Idempotent against ``hl_last_funding_time_ms`` (the SAME anchor the REST
+        poll uses) — only credits events strictly newer than the last one counted.
+        BUG-042: HL replays the full funding history (``isSnapshot``) on every WS
+        (re)connect; the old blind ``+=`` re-added the entire history on each of the
+        ~13 reconnects, inflating hl_funding_collected ~13× (APT: real $0.012 stored
+        as $0.157). Same failure class as BUG-017 on the HL-only side. Events without
+        a timestamp are dropped here — the REST poll is ground truth and will catch them.
+        """
         pos = self.positions.get(asset)
         if pos is None or pos.state != CrossVenueState.HOLD:
             return
+        if not time_ms or time_ms <= pos.hl_last_funding_time_ms:
+            return
         # HL short earns positive funding, HL long pays negative
         pos.hl_funding_collected += amount
+        pos.hl_last_funding_time_ms = time_ms
         self._stats.total_funding_usd += amount
         await self._db_update_funding(pos)
 
@@ -1249,8 +1312,9 @@ class CrossVenueStrategy:
                 continue
             try:
                 hl_size = await self._hl.get_perp_position_size(asset)
-                lt_pos  = await self._lt.get_position_for_asset(asset)
-                lt_size = abs(float(lt_pos.get("size", 0) or 0)) if lt_pos else 0.0
+                # use raise-variant so HTTP errors (403/503) propagate to the
+                # except below and skip this tick — avoids false drift_orphan close
+                lt_size = await self._lt.get_position_size_or_raise(asset)
             except Exception as e:
                 crash_log(f"CrossVenue.drift_check.{asset}.fetch", e)
                 continue
@@ -1267,13 +1331,16 @@ class CrossVenueStrategy:
                     f"HL={hl_size:.6f} ({hl_drift*100:.1f}%) "
                     f"LT={lt_size:.6f} ({lt_drift*100:.1f}%)"
                 )
-                await self._notify(
-                    f"⚠️ <b>Position drift: {asset}</b>\n"
-                    f"Booked: {expected:.6f}\n"
-                    f"HL actual: {hl_size:.6f} (Δ {hl_drift*100:.1f}%)\n"
-                    f"LT actual: {lt_size:.6f} (Δ {lt_drift*100:.1f}%)\n"
-                    f"Manual check recommended."
-                )
+                now_f = time.time()
+                if now_f - self._last_drift_alert.get(asset, 0) >= self._DRIFT_ALERT_COOLDOWN_S:
+                    self._last_drift_alert[asset] = now_f
+                    await self._notify(
+                        f"⚠️ <b>Position drift: {asset}</b>\n"
+                        f"Booked: {expected:.6f}\n"
+                        f"HL actual: {hl_size:.6f} (Δ {hl_drift*100:.1f}%)\n"
+                        f"LT actual: {lt_size:.6f} (Δ {lt_drift*100:.1f}%)\n"
+                        f"Manual check recommended."
+                    )
 
                 # If one leg is completely missing → other leg is naked → emergency close
                 missing_threshold = 0.5  # leg < 50% of booked = effectively gone
@@ -1282,6 +1349,139 @@ class CrossVenueStrategy:
                     await self._close_position(
                         asset, pos, reason="drift_orphan", use_taker=True
                     )
+
+    # ── Exchange-truth reconciliation (P0) ────────────────────────────────────
+
+    async def _hl_all_positions(self) -> Dict[str, float]:
+        """All nonzero HL perp positions → {asset: signed_size}. Raises on error."""
+        ch = await self._hl.get_clearinghouse()
+        out: Dict[str, float] = {}
+        for ap in ch.get("assetPositions", []):
+            p = ap.get("position", {})
+            coin = p.get("coin")
+            szi = float(p.get("szi", 0) or 0)
+            if coin and abs(szi) > 1e-9:
+                out[coin] = szi
+        return out
+
+    async def _lt_all_positions(self) -> Dict[str, float]:
+        """All nonzero Lighter positions → {asset: signed_size}. Raises on error."""
+        acct = await self._lt.get_account()
+        out: Dict[str, float] = {}
+        for p in acct.get("positions", []):
+            sym = p.get("symbol")
+            size = abs(float(p.get("position", 0) or 0))
+            sign = int(p.get("sign", 1) or 1)  # 1 long, -1 short
+            if sym and size > 1e-9:
+                out[sym] = size * sign
+        return out
+
+    async def _cancel_all_resting_orders(self) -> None:
+        """Cancel every resting HL order (all assets). Used at recovery start so a
+        leftover maker close/entry order cannot fill after we snapshot positions."""
+        try:
+            open_orders = await self._hl.get_open_orders()
+        except Exception as e:
+            crash_log("CrossVenue._cancel_all_resting_orders.list", e)
+            return
+        coins = {o.get("coin") for o in open_orders if o.get("coin")}
+        for coin in coins:
+            try:
+                await self._hl.cancel_all(coin)
+                log(f"CrossVenue.reconcile: cancelled resting HL orders on {coin}")
+            except Exception as e:
+                crash_log(f"CrossVenue._cancel_all_resting_orders.{coin}", e)
+
+    async def reconcile_orphans(self) -> None:
+        """P0 — Exchange-truth sweep. Treats BOTH exchanges as source of truth and
+        flattens any nonzero position that is NOT part of a tracked cross-venue cycle.
+
+        This is the safety net the per-position drift check cannot provide: drift only
+        iterates self.positions, so a leg left behind after a cycle is ABANDONED/CLOSED
+        (resting-order race, duplicate open, ghost desync) becomes invisible and lives
+        on the exchange as naked directional risk until a human notices. The sweep sees
+        it because it asks the exchanges, not the bot's own bookkeeping.
+
+        Safety: (1) gated until startup recovery finished; (2) skips any asset we are
+        actively tracking (ENTERING/HOLD/EXITING); (3) 2-strike debounce so a transient
+        or partial API read can never trigger a wrong flatten.
+        """
+        if not self._recovery_done:
+            return
+        try:
+            hl_pos = await self._hl_all_positions()
+            lt_pos = await self._lt_all_positions()
+        except Exception as e:
+            # Any fetch error → skip this sweep entirely (never act on partial data)
+            crash_log("CrossVenue.reconcile_orphans.fetch", e)
+            return
+
+        tracked = {
+            a for a, p in self.positions.items()
+            if p.state in (
+                CrossVenueState.ENTERING, CrossVenueState.HOLD, CrossVenueState.EXITING
+            )
+        }
+        assets = set(hl_pos) | set(lt_pos)
+        for asset in assets:
+            if asset in tracked:
+                self._orphan_strikes.pop(asset, None)
+                continue
+            hl_sz = hl_pos.get(asset, 0.0)
+            lt_sz = lt_pos.get(asset, 0.0)
+            if abs(hl_sz) < 1e-9 and abs(lt_sz) < 1e-9:
+                self._orphan_strikes.pop(asset, None)
+                continue
+
+            # Untracked nonzero leg(s). Debounce before acting.
+            strikes = self._orphan_strikes.get(asset, 0) + 1
+            self._orphan_strikes[asset] = strikes
+            log_warn(
+                f"CrossVenue.reconcile: ORPHAN {asset} (untracked) "
+                f"HL={hl_sz:.6f} LT={lt_sz:.6f} strike {strikes}/{self._ORPHAN_STRIKE_LIMIT}"
+            )
+            if strikes < self._ORPHAN_STRIKE_LIMIT:
+                continue
+            self._orphan_strikes.pop(asset, None)
+
+            await self._notify(
+                f"🧹 <b>Orphan flatten: {asset}</b>\n"
+                f"Untracked exchange position (no active cycle).\n"
+                f"HL: {hl_sz:.6f} | Lighter: {lt_sz:.6f}\n"
+                f"Closing both legs reduce-only (taker)."
+            )
+            # Flatten each nonzero leg with a reduce-only taker order.
+            if abs(hl_sz) > 1e-9:
+                try:
+                    is_buy = hl_sz < 0  # short → buy to close; long → sell
+                    book = await self._hl.get_l2_book(asset)
+                    levels = book.get("levels", [[], []])
+                    if is_buy:
+                        raw = float(levels[1][0]["px"]) * 1.01 if levels[1] else 0.0
+                    else:
+                        raw = float(levels[0][0]["px"]) * 0.99 if levels[0] else 0.0
+                    if raw > 0:
+                        px = self._hl.round_price(raw)
+                        await self._hl.place_taker(
+                            asset, is_buy=is_buy, size=abs(hl_sz), price=px, reduce_only=True
+                        )
+                        log(f"CrossVenue.reconcile: {asset} HL orphan leg flattened (taker)")
+                except Exception as e:
+                    crash_log(f"CrossVenue.reconcile.flatten_hl.{asset}", e)
+            if abs(lt_sz) > 1e-9:
+                try:
+                    is_buy = lt_sz < 0  # short → buy to close; long → sell
+                    lt_bid, lt_ask = await self._lt.get_best_prices(asset)
+                    if is_buy:
+                        px = lt_ask * 1.05 if lt_ask > 0 else 999999.0
+                    else:
+                        px = lt_bid * 0.95 if lt_bid > 0 else 0.0001
+                    await self._lt.place_taker(
+                        asset, is_buy=is_buy, size=abs(lt_sz), price=px, reduce_only=True
+                    )
+                    log(f"CrossVenue.reconcile: {asset} Lighter orphan leg flattened (taker)")
+                except Exception as e:
+                    crash_log(f"CrossVenue.reconcile.flatten_lt.{asset}", e)
 
     # ── Utilities ─────────────────────────────────────────────────────────────
 

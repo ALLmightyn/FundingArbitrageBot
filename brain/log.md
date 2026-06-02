@@ -4,7 +4,15 @@
 
 ---
 
+## 2026-05-31
+
+`2026-05-31 11:15 | strategies/cross_venue_carry.py | BUGFIX — drift TG-спам: добавлен _last_drift_alert cooldown 1800s (30 мин). До патча: check_position_drift() шлёл TG-алерт каждые 5 мин без ограничения при любом дрифте. Первопричина спама: два экземпляра бота работали параллельно (PM2 + ручной nohup), оба открыли ADA → 2× позиции на биржах (HL=191, LT=316 vs booked=105). Оба процесса убиты, ADA закрыта тейкером (HL SELL 191 @ 0.23728, LT BUY 316.4 @ 0.23798), DB записи → ABANDONED. Перезапущено через PM2 единственным экземпляром.`
+
+---
+
 ## 2026-05-30
+
+`2026-05-30 20:30 | strategies/cross_venue_carry.py | BUGFIX BUG-042 — drift check: get_position_for_asset → get_position_size_or_raise. Lighter API 403/503 теперь бросает исключение → outer try/except делает continue (пропускает тик). Раньше: 403 глоталось внутри get_positions → возврат {} → lt_size=0.0 → ложный drift_orphan → emergency taker close → убыток $0.02 (APT цикл 2026-05-30 20:11).`
 
 `2026-05-30 | strategies/cross_venue_carry.py, core/constants.py | BUGFIX BUG-040+041 — Lighter-нога: maker 90s → taker IOC fallback (0% fee). Добавлен LT_ENTRY_MAKER_TIMEOUT_S=15s. После 15s maker → place_taker IOC + 2× ZK-settle check (5s+5s). Финальный 6s ZK-lag guard перед _cover_naked_hl_leg предотвращает orphan Lighter short. Устраняет цепочку: timeout → HL cover fee → entry_fail_streak → 4h blacklist лучшего актива.`
 
@@ -157,3 +165,23 @@
 `2026-05-29 | venues/lighter.py + strategies/cross_venue_carry.py | BUG-036 FIX — Lighter maker side inverted (buy@ask/sell@bid = POST_ONLY reject = ghost). Исправлено на buy@bid/sell@ask. + HL taker fallback при maker-timeout. + единый _entry_fail_streak (HL timeout ИЛИ Lighter ghost), 3 подряд → 4ч blacklist. Корень всех legging-cover потерь на BCH/NEAR/TAO.`
 
 `2026-05-30 | venues/hyperliquid.py + strategies/cross_venue_carry.py + core/models.py + schema.sql | BUG-038 FIX — HL funding: заменён cumFunding.sinceOpen (сбрасывается при закрытии ноги) на userFunding REST API (реальные USD-суммы, idempotent по time_ms). BUG-039 FIX — recovery orphan close: lt_is_buy=long_v→short_v (SELL вместо BUY удваивал Lighter short).`
+
+`2026-06-02 | AUDIT | Полный аудит за 6 дней (с 05-27). CLOSED: 6 циклов, net −$0.0498 (весь минус = fees на emergency_margin/drift_orphan, funding не собран). ABANDONED: 9 (ghost/дубли, net $0). OPEN: APT short-Lighter/long-HL, hold 45.4h, funding +$0.1706 (HL $0.157 + LT $0.0136), fee $0.0037 → net MTM +$0.163, чистый APR ≈126% на notional. Единственный нормальный закрытый выход: BCH spread_flip +$0.014/9.8h. Economic P&L всего ≈ +$0.11. Механика funding-tracking (BUG-034/038) подтверждена — реальные USD сходятся. Real APR ≠ displayed (дисплей завышает ~7×). pm2 6 рестартов (все краши 28 мая, до текущего запуска 31 мая, сейчас стабилен).`
+
+`2026-06-02 | brain/leverage_and_margin.md | VERIFIED LIVE — снято с обеих бирж. Плечо cross-venue = 10x CROSS на ОБЕИХ (PERP_LEVERAGE=3 = только HL-only main.py, в cross set_leverage не вызывается). Init margin 10%, maint ~5% (HL) / ~6% (Lighter). Per-asset cap: TAO макс 5x. Капитал перекошен: HL accountValue $5.76 (marginUsed 83%) vs Lighter $100 → HL узкое место, скейл невозможен без долива USDC на HL. Per-venue ликвидация: дамп long-ноги → HL ликвиднётся даже при нейтральной нетто.`
+
+`2026-06-02 | ⚠️ FINDING ORPHAN — на HL висит НЕхеджированный ADA short szi -105 (~$23.4), Lighter ADA=0 (flat). Орфан от manual_close_ada_duplicate: закрылась только Lighter-нога, HL осталась голой. Сейчас +$1.54 случайно, но это голый направленный риск + жрёт $2.34 маржи на тонком HL. DB не трекает (не в OPEN). Требует ручного закрытия/рехеджа.`
+
+`2026-06-02 | ⚠️ FINDING FUNDING-BUG — DB hl_funding_collected APT = $0.157, но реальный HL userFunding = $0.012 (49 событий) и cumFunding sinceOpen = -$0.011. Завышено ~13×. Lighter ОК ($0.0136 = total_funding_paid_out). → реальный funding открытой APT ≈ +$0.026 за 45h, real APR ~14-20%, НЕ 126%. Похоже userFunding-аккумуляция в боте не дедупит (anchor на последнем событии, но сумма 13× больше). Кандидат на BUG-042. Аудит P&L от 2026-06-02 надо пересчитать с реальными цифрами.`
+
+`2026-06-02 | strategies/cross_venue_carry.py + main_cross.py | BUG-042 FIX — HL funding overcount ~14× (WS isSnapshot replay, рецидив BUG-017). record_hl_funding идемпотентен по hl_last_funding_time_ms + skip isSnapshot в _on_ws_message. DB открытой APT исправлена 0.157→0.011271. Verified: после рестарта+реконнекта funding $0.0252 не раздулся. Реальный APR открытой APT ~14-20%, НЕ 126%.`
+
+`2026-06-02 | EXCHANGE STATE | ADA-орфан закрыт ботом (drift/orphan logic): Close Short 105 @0.2227 closedPnl +$1.533 fee $0.010. HL equity после: $2.46 ≈ занятая маржа APT $2.45 (буфер ~0). Ledger переводов за 8ч нет — просадка $5.76→$2.46 необъяснима из API (квирк perp/spot аккаунтинга или транзиент). WATCH: HL тонкий, перед скейлом долить USDC.`
+
+`2026-06-02 | EXCHANGE + DB RECONCILED | APT закрыт (drift_orphan, net +$0.0102 по честным числам). Обе биржи FLAT (HL accountValue 0.0, Lighter collateral $100.32), 0 открытых циклов. Бот ОСТАНОВЛЕН (pm2 stop). Причина голой ноги: старый процесс выставил maker close HL-ноги → я рестартнул для BUG-042 fix → recovery снял снимок HL=27.14 ДО исполнения ордера → ордер исполнился → бот считал обе ноги живыми, Lighter остался голый. Drift-детектор поймал и закрыл. РЕШЕНИЕ ПРИНЯТО: чинить реконсиляцию БД↔биржа перед любым возобновлением.`
+
+`2026-06-02 | ROOT CAUSE орфанов (для фикса) | drift-детектор проверяет ТОЛЬКО позиции в in-memory positions dict. Как только цикл помечен ABANDONED/CLOSED — он удаляется из tracking, и любой остаточный exchange-position становится НЕВИДИМЫМ орфаном (ADA dup, XLM ghosts — их закрывал юзер руками). Источники рассинхрона: (1) resting order исполняется после snapshot/restart; (2) дубль-вход (2× ADA за 2 мин при max=1); (3) DB OPEN без exchange position (ghost). Фикс: периодический sweep по ВСЕМ exchange-позициям обеих бирж как source of truth, независимо от того, что бот «трекает».`
+
+`2026-06-02 | strategies/cross_venue_carry.py + main_cross.py | BUG-043 FIX (P0-P3 реконсиляция) — reconcile_orphans() exchange-truth sweep (flatten орфанов вне tracked-циклов, 2-страйк дебаунс, gated recovery); dup-guard в _enter_position (проверка обеих бирж, fail-closed); _cancel_all_resting_orders() в начале recovery (чинит resting-order гонку); _recovery_done флаг. Validated на флэте (no-op) + симуляции орфана (flatten reduce-only). Бот пока ОСТАНОВЛЕН — не возобновлял live.`
+
+`2026-06-02 | core/constants.py | WHITELIST EXPANDED 21→70 активов — добавлены все активы присутствующие на HL (maxLev≥5x, OI>$1M) И на Lighter. Было: 21 (только tier-1 bluechips). Стало: 70 (+49). Новые тир-2 (10x HL): HYPE ZEC TON PUMP WLD PAXG FARTCOIN 1000PEPE ENA ONDO TRX JUP TRUMP CRV 1000BONK 1000SHIB DYDX XPL. Тир-3 (5x HL): LIT ASTER XMR MON ZRO WLFI PENDLE LDO VIRTUAL HBAR ICP EIGEN MNT WIF MORPHO ETHFI TIA STRK FIL POL SPX SEI BERA ZK PYTH KAITO AVNT 1000FLOKI AXS XLM. Instant scan 30/70 выше threshold, top=LDO 508% APR (instant). Исторический фильтр 24h + TWAP gate + sigma-spike = страховка от спайков.`

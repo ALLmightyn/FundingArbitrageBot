@@ -211,3 +211,19 @@ Full e2e testing requires mainnet. On testnet bot correctly skips all assets and
 - Cause: `maker_chase_entry` возвращает None после timeout; стратегия сразу вызывает `_cover_naked_hl_leg`, но ZK-rollup ещё не смаркировал fill в state. Recovery правильно закрывал orphan, но это delta-риск + лишние fees.
 - Fix: после всех maker/taker попыток — 6s final ZK-lag guard: проверяем `get_position_for_asset`. Если size ≥ 90% target → `zk_lag_fill`, НЕ крываем HL.
 - File: `strategies/cross_venue_carry.py:_enter_position` ZK-lag guard block (после lt_order_id is None)
+
+**BUG-042** HL funding завышен ~14× в БД (APT: real $0.0113 хранилось как $0.157) → ложный APR 126% вместо реального ~14-20%.
+- Cause: WS-путь `record_hl_funding()` делал blind `pos.hl_funding_collected += amount` без идемпотентности и НЕ двигал `hl_last_funding_time_ms`. HL шлёт полную историю funding (`isSnapshot`) на КАЖДОМ (ре)коннекте WS → каждый из ~13 реконнектов (6 рестартов pm2 + авто-reconnect) пере-добавлял всю историю. Плюс REST-поллер видел те же события «новыми» (анкер не двигался) и добавлял ещё раз. Тот же класс, что BUG-017 (HL-only), но не был портирован в cross.
+- Fix: (1) `record_hl_funding(asset, amount, time_ms)` — идемпотентен по общему с REST анкеру `hl_last_funding_time_ms`: кредитует только события строго новее последнего, двигает анкер; события без time_ms дропает (REST = ground truth). (2) `main_cross.py:_on_ws_message` — skip `isSnapshot` фреймов + прокидывает `f["time"]` в record_hl_funding.
+- Recovery: DB открытой APT исправлена 0.157→0.011271 (real userFunding sum, 46 событий, совпало с cumFunding.sinceOpen), anchor=1780401600006. После рестарта+WS-реконнекта funding остался $0.0252, не раздулся.
+- File: `strategies/cross_venue_carry.py:record_hl_funding`; `main_cross.py:_on_ws_message`
+
+`ВАЖНО для аудитов:` displayed/DB funding до 2026-06-02 16:00 завышен этим багом. Lighter accounting корректен (positionFunding API). Реальный P&L закрытых циклов считать по userFunding REST, не по DB hl_funding_collected.
+
+**BUG-043** Невидимые орфаны: рассинхрон БД↔биржа оставлял голые ноги на бирже, которые drift-детектор не видел (он итерирует только self.positions; ABANDONED/CLOSED цикл уходит из трекинга → остаток на бирже невидим). Юзер закрывал руками. Источники: (1) resting close-ордер исполняется ПОСЛЕ recovery-снимка (поймали вживую 2026-06-02: HL maker close висел → рестарт → recovery снял HL=27.14 до исполнения → Lighter остался голый); (2) дубль-вход (2× ADA за 2 мин при max=1); (3) DB OPEN без exchange position (ghost).
+- Fix P0 — `reconcile_orphans()` (cross_venue_carry.py): sweep ВСЕХ позиций обеих бирж как source of truth; любая ненулевая позиция вне tracked-цикла (ENTERING/HOLD/EXITING) → flatten reduce-only taker. Gated до конца recovery; 2-страйк дебаунс против транзиентных API-чтений; вызывается в main_cross после drift-check.
+- Fix P1 — dup-guard в `_enter_position`: перед открытием проверка позиции на ОБЕИХ биржах, fail-closed; если есть остаток → abort + cooldown.
+- Fix P2/P3 — `_cancel_all_resting_orders()` в начале `recover_open_positions` + sleep 1s: гасит висящие HL-ордера ДО снимка позиций. `_recovery_done` флаг гейтит sweep.
+- Helpers: `_hl_all_positions` / `_lt_all_positions` → {asset: signed_size}.
+- Validated 2026-06-02: на флэт-аккаунте sweep no-op (0 ложных); на симуляции APT-орфана (LT short -27.14) — страйк1 без ордера, страйк2 flatten reduce-only buy, tracked → skip.
+- Files: `strategies/cross_venue_carry.py`, `main_cross.py`

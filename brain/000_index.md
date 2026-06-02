@@ -111,3 +111,8 @@ sqlite3 database/carry.db "SELECT asset, round((strftime('%s','now')-entered_at)
 - [HL API & Fee Specs](hyperliquid_specs.md)
 - [Bug Graveyard](bugs_and_fixes.md) ← читать перед правкой order/entry/exit кода
 - [Change Diary](log.md)
+- [Yield Landscape & 3 рычага](yield_landscape.md) ← почему carry скромен + где апсайд (ресерч 2026-05-30)
+- [Persistence Gate](persistence_gate.md) ← серия часов подряд > hit_ratio, режет убыточные входы (2026-05-31)
+- [Leverage & Margin](leverage_and_margin.md) ← плечо 10x cross на ОБЕИХ биржах (НЕ PERP_LEVERAGE=3), per-venue ликвидация, капитал перекошен HL $5.76 / Lighter $100 (verified live 2026-06-02)
+
+**WHITELIST UPDATE (2026-06-02):** Расширен 21→70 активов — все пары HL+Lighter с maxLev≥5x и OI>$1M. Instant scan теперь видит 30 кандидатов против 1 (BCH). Исторический фильтр всё равно gate-ит по 24h avg hits.
