@@ -1,11 +1,16 @@
 ---
 Type: Strategy Reference
-Status: Active (testnet)
-Updated: 2026-05-04
+Status: ⛔ DEPRECATED — HL-only spot+perp (НЕ live)
+Updated: 2026-05-04 (помечено устаревшим 2026-06-03)
 Linkage: [[000_index]]
 ---
 
-# Текущая стратегия — Funding Rate Carry
+> ⛔ **ВНИМАНИЕ — ЭТОТ ФАЙЛ ОПИСЫВАЕТ СТАРУЮ HL-ONLY СТРАТЕГИЮ** (`main.py` / `strategies/funding_carry.py`).
+> Она **НЕ запущена**. Live = **cross-venue HL↔Lighter** (`main_cross.py` / `strategies/cross_venue_carry.py`),
+> **MAINNET**, perp-short на high-rate бирже + perp-long на low-rate. Spot/IronDome/PERP_LEVERAGE ниже
+> к live-боту **не относятся**. Актуальная state machine и exit-логика → [[000_index]].
+
+# Старая стратегия — Funding Rate Carry (HL-only, deprecated)
 
 ## State Machine
 

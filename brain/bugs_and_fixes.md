@@ -227,3 +227,66 @@ Full e2e testing requires mainnet. On testnet bot correctly skips all assets and
 - Helpers: `_hl_all_positions` / `_lt_all_positions` → {asset: signed_size}.
 - Validated 2026-06-02: на флэт-аккаунте sweep no-op (0 ложных); на симуляции APT-орфана (LT short -27.14) — страйк1 без ордера, страйк2 flatten reduce-only buy, tracked → skip.
 - Files: `strategies/cross_venue_carry.py`, `main_cross.py`
+
+## BUG-044 (FIXED) — restart с открытой позицией → грязный two-phase close (2026-06-03)
+**Что:** pm2 restart при открытой WLD. Recovery нашёл OPEN cycle, **сам закрыл HL-ногу** maker'ом (SELL @0.5013, 16:45:07), затем re-check показал «PARTIAL HL=0 LT=62.4» и закрыл Lighter **taker reduce_only=False** @0.527. Лог выглядит как orphan, хотя обе ноги были на месте — recovery закрыл их в 2 этапа с ~8с разрывом.
+**Последствие:** WLD force-closed (state=ABANDONED, recover_partial_close) вместо естественного выхода. HL-нога зафиксировала closedPnl=+$6.24, дельта-нейтраль сохранилась, equity ~break-even/+. Голой ноги/runaway НЕ было. Но ноги закрылись на расходящихся ценах (HL 0.5013 vs LT 0.527 = 5%) → риск проскальзывания на масштабе.
+**Грабли:** материализовался риск «restart с открытой позицией» (уже видели db_ghost/recover_partial_close раньше). reduce_only=False на orphan-close — потенциально опасно (мог бы открыть, а не закрыть; спасло то что Lighter нетит позицию).
+**КОРЕНЬ:** `main_cross.py` finally-блок закрывал ВСЕ позиции на shutdown (`reason="shutdown"`). pm2 SIGKILL ~1.6с после SIGTERM → handler успевал закрыть только HL-ногу maker'ом → реальный partial → recovery дочищал Lighter. Shutdown-close ДРАЛСЯ с RESTORE-логикой recovery. RESTORE 28 мая сработал только потому что тогда был жёсткий SIGKILL без finally.
+**FIX (2026-06-03):**
+1. `main_cross.py` finally: больше НЕ закрывает позиции на shutdown — дельта-нейтраль безопасна между рестартами, recovery её RESTORE'ит. Escape-hatch: env `FLATTEN_ON_SHUTDOWN=true` для принудительного flatten при полной остановке.
+2. `cross_venue_carry.py` recovery orphan-close Lighter: добавлен `reduce_only=True` (был дефолт False → риск открыть вместо закрыть).
+**Итог:** теперь pm2 restart с открытой позицией → позиция остаётся на биржах → recovery RESTORE to HOLD. Безопасно.
+
+---
+
+## WATCH-045 — price_divergence taker-выход = систематический слив (АУДИТ 2026-06-05)
+**Статус:** ОТКРЫТ (кандидат на фикс, не баг исполнения — логика).
+**Симптом:** 4 цикла закрыты по price_divergence, все net-отрицательны (-$0.040 суммарно). ZEC дважды за 27мин.
+**Механика:** `cross_venue_carry.py` price_divergence: при |HL_mid − LT_mid| > 2% → немедленный taker-close ОБЕИХ ног.
+**Почему это слив:** позиция delta-neutral (short одна биржа / long другая). Расхождение mid-цен между биржами НЕ ломает нейтральность — PnL ног движется в противофазе. Но бот фиксирует это taker'ом (~0.09% round-trip) в гарантированный fee-убыток. Значения (ZEC 339.39/332.27, WLD 0.5246/0.5388, ICP 2.61/2.55) похожи на quote-noise (тонкий стакан / устаревший mid), а не реальный 2% базис.
+**Варианты фикса (не применены — нужен дизайн-ребют с юзером):**
+1. Поднять порог до 3-4% ИЛИ требовать N последовательных снапшотов (debounce от шума).
+2. Не выходить если дельта-нейтраль цела (проверять обе ноги живы) — divergence сам по себе не риск ликвидации.
+3. Если выходить — хотя бы HL maker (как сделали для spread_flip), не обе taker.
+**Связано:** тонкий realized spread (см. log 2026-06-05 аудит) — на жирном карри fee не так больно; на 0.005%/h любой ранний taker-выход = минус.
+
+## WATCH-046 — HL maker-chase бьётся в taker fallback (АУДИТ 2026-06-05)
+23 taker fallback на входе. "Post only order would have immediately matched" (asset=222 и др.). HL entry уходит в taker 0.045% вместо maker 0.015% → утраивает entry fee. Maker-chase цена пересекает движущийся стакан. Нужно: либо менее агрессивный chase-offset, либо принять и считать в EV.
+
+## WATCH-047 — Lighter size error на ZEC (АУДИТ 2026-06-05)
+code=21706 "invalid order base or quote amount" / "Order has invalid size" — 12× ВСЕ на ZEC (цена ~339). szDecimals/round_size для ZEC неверный. Проверить кэш szDecimals для ZEC на Lighter.
+
+## WATCH-048 — DB funding ≠ биржа: ADA orphan (СВЕРКА 2026-06-05)
+**Найдено сверкой HL userFunding API против cross_venue_cycles.**
+HL leg итог: **биржа +$0.06642 vs DB +$0.04727** → DB недосчитывает ~$0.019 (29%).
+Совпадают точно: ICP, WLD, TRX, ZEC. Расходятся:
+- **ADA: DB −$0.00774 vs биржа +$0.01209** (свинг $0.02). Причина: 31.05 были 2 дубль-цикла ADA (manual_close_ada_duplicate, закрыты 07:15), НО реальная HL-позиция szi=−105 осталась жить на бирже и копила +$0.0003/ч ~2 суток (до 06-02 16:00, рядом с рестартом). DB пометил ABANDONED → ~$0.013 фандинга НЕ записаны. Orphan позиция = невидимый для учёта фандинг.
+- **NEAR: DB $0 vs биржа −$0.00062** — пропущен HL settlement.
+**Текущий учёт ОК:** живой ADA-цикл (06-05) DB +$0.00023 = биржа (11:00+12:00). Баг исторический, от дубль/abandon инцидента, не от текущего кода userFunding.
+**Вывод для отчётности:** нельзя доверять SUM(funding) из DB как истине — сверять с биржей. Реальный HL +$0.066, не +$0.047.
+**Lighter leg (DB +$0.087) с биржей НЕ сверен** — нужен authenticated positionFunding API. TODO.
+
+## WATCH-049 — ночной рестарт = unattended-upgrades (РАЗГАДАНО 2026-06-05)
+**Вопрос:** бот сам перезапустился ночью 06-05 06:42, без деплоя и без краша. Почему?
+**Причина (точно по journalctl + apt history):**
+- `apt-daily-upgrade.timer` сработал 06:42:04 → `unattended-upgrade` обновил 13 пакетов (dovecot, mysql-server-8.0, liblzma5/xz-utils, libwww-perl, **python3-urllib3**).
+- В ходе апгрейда systemd делал `daemon-reload` + каскад рестартов сервисов → в 06:42:30 **остановил pm2-root.service** ("Stopping PM2 process manager") → SIGTERM боту.
+- BUG-044 handler отработал штатно: "Leaving 1 position open for recovery: ICP" (НЕ force-close). pm2 поднялся 06:42:39 → recovery **RESTORED ICP to HOLD**. Голой ноги не было.
+- Машина НЕ ребутилась (uptime с 27.05). Это сервис-рестарт, не reboot.
+**Повторяемость:** `apt-daily-upgrade.timer` фактически срабатывает каждую ночь (next: 06-06 ~06:12). Значит рестарт бота — РЕГУЛЯРНОЕ ночное событие, не разовое.
+**Вывод:** BUG-044 фикс ровно для этого и нужен — теперь ночные апгрейды безопасны (позиция переживает, RESTORE). Раньше каждую ночь был бы force-close.
+**Опции если мешает:** (1) ничего — фикс делает безопасно; (2) `systemctl disable --now apt-daily-upgrade.timer` чтобы убрать ночные апгрейды; (3) перевести бот на отдельный systemd-unit, не завязанный на pm2-root, чтобы апгрейды его не дёргали. python3-urllib3 обновился под системным питоном (бот на /usr/bin/python3) — перезапуск подхватил новую версию без ошибок.
+
+---
+**WATCH-045 / 046 — ADDRESSED 2026-06-05:** price_divergence теперь HL maker + LT taker, порог 2→4%. HL entry maker-окно 60s (timeout_s) против taker fallback. + flip-порог -0.005%, 4ч flip-reentry cooldown, entry threshold 0.008%. Деплой session=391fc1a7, ADA RESTORED live. Эффект мониторить по net следующих циклов. См. log 2026-06-05.
+
+## BUG-050 — Lighter maker_chase double-fill (cancel-race) → 2× нога (2026-06-05)
+**Симптом:** MON вошёл, дрейф-гард показал booked=1155.8 HL=1156 (0%) **LT=2311.6 (100%)** — Lighter-нога вдвое. Позиция НЕ дельта-нейтральна ~15 мин (1155 MON нехеджированного шорта), пока flip-выход не оставил orphan → reconcile flatten taker.
+**Root cause (по логам 13:48):** maker_chase repost-ветка: attempt1 SELL 1155.8 → 5с → fill-check мимо (ZK ещё не оселся) → `cancel_order` вернул **"OK"** (НЕ None) хотя ордер уже исполнился (fill+cancel-ack в одном блоке ZK) → attempt2 долил ещё 1155.8 → 2311.6. Пост-проверка филла в `venues/lighter.py` стояла ТОЛЬКО в ветке `cancelled is None`, ветку `cancelled OK` не покрывала.
+**Дыра №2:** `check_position_drift` реагировал только на НЕДОСТАЮЩУЮ ногу (<50%=голая), избыточную (200%) только варнил, не выправлял.
+**FIX (2026-06-05):**
+1. `venues/lighter.py` maker_chase: пост-cancel проверка филла теперь ВСЕГДА (не только при cancelled is None) — wait 2s ZK settle + сравнить дельту позиции → если налилось, return FILLED (не репостить). Закрывает cancel-OK-but-filled гонку.
+2. `cross_venue_carry.py` check_position_drift: если Lighter-нога > booked на >DRIFT_TOLERANCE_PCT → reduce-only taker тримит excess немедленно (reduce_only не может флипнуть). Defense-in-depth.
+**Связано:** [[WATCH-047]] (ZK size errors), семейство BUG-036 (Lighter maker ghost).
+**Статус:** задеплоено session TBD. Мониторить: больше нет "DRIFT ... 100%" без немедленного trim.

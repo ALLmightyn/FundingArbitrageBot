@@ -33,6 +33,7 @@ from core.constants import (
     SPREAD_TWAP_MIN_SAMPLES,
     STABILITY_LOOKBACK_HOURS,
     STABILITY_MIN_HIT_RATIO,
+    PERSISTENCE_FEE_MULT,
 )
 from core.logger import log, log_warn, crash_log
 from core.models import SpreadSnapshot
@@ -183,6 +184,15 @@ class SpreadScanner:
                             f"/{stats['samples']}={stats['hit_ratio']*100:.0f}%<{STABILITY_MIN_HIT_RATIO*100:.0f}%)"
                         )
                         continue
+                    # Persistence gate: longest consecutive carry run must out-earn the
+                    # round-trip fee with margin, else break-even is never reached.
+                    min_run_earn = FEE_CROSS_ROUND_TRIP * PERSISTENCE_FEE_MULT
+                    if stats.get("run_earn", 0.0) < min_run_earn:
+                        skipped.append(
+                            f"{asset}(run={stats.get('max_run',0)}h "
+                            f"earn={stats.get('run_earn',0.0)*100:.3f}%<{min_run_earn*100:.3f}%)"
+                        )
+                        continue
                     snap = self.snapshots.get(asset)
                     if snap is None:
                         skipped.append(f"{asset}(no_snap)")
@@ -330,6 +340,8 @@ class SpreadScanner:
                 # Signed spread for each hour: hl_rate - lt_rate. Sign matters for
                 # determining short_venue, but we score on the *absolute* magnitude
                 # of the median spread, then derive direction from the sign.
+                # Sort chronologically so consecutive-run analysis is valid.
+                paired_spreads.sort(key=lambda t: t[0])
                 signed = [hl - lt for (_, hl, lt) in paired_spreads]
                 abs_vals = [abs(x) for x in signed]
                 n = len(signed)
@@ -351,6 +363,26 @@ class SpreadScanner:
 
                 hit_ratio = hits / n
 
+                # Persistence (persistence_gate.md): break-even needs CONSECUTIVE hours.
+                # Walk the directional hourly series, find the longest run of hours above
+                # threshold in the dominant direction, and sum the spread earned in it.
+                # run_earn = best contiguous cumulative carry available — compare to fee.
+                directional = signed if mean_signed >= 0 else [-s for s in signed]
+                max_run = 0
+                run_earn = 0.0
+                cur_run = 0
+                cur_earn = 0.0
+                for s in directional:
+                    if s >= SPREAD_ENTRY_THRESHOLD:
+                        cur_run += 1
+                        cur_earn += s
+                        if cur_earn > run_earn:
+                            run_earn = cur_earn
+                            max_run = cur_run
+                    else:
+                        cur_run = 0
+                        cur_earn = 0.0
+
                 # Score: emphasise BOTH average magnitude AND consistency.
                 # Two coins with the same 0.03%/h mean but one with 22/24 hits
                 # and the other with 12/24 are very different bets.
@@ -363,6 +395,8 @@ class SpreadScanner:
                     "samples":        n,
                     "dominant_short": dominant_short,
                     "score":          score,
+                    "max_run":        max_run,
+                    "run_earn":       run_earn,
                     "updated_at":     int(time.time()),
                 }
 

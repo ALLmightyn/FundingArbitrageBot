@@ -341,12 +341,27 @@ async def carry_loop() -> None:
         crash_log("carry_loop.fatal", e, traceback.format_exc())
         raise
     finally:
-        # Gracefully close all open positions
-        for asset, pos in list(strategy.positions.items()):
-            try:
-                await strategy._close_position(asset, pos, reason="shutdown")
-            except Exception:
-                pass
+        # Open positions are delta-neutral (hedged short+long) and safe to leave
+        # across a restart — recover_open_positions() RESTORES them to HOLD on next
+        # boot. Do NOT close them here: pm2 restart sends SIGKILL ~1.6s after SIGTERM,
+        # so this handler often only manages to close ONE leg before being killed,
+        # leaving a real partial that recovery then has to taker-clean (BUG-044).
+        # Closing on shutdown also fights the RESTORE logic — they cancel out.
+        # Escape hatch: set FLATTEN_ON_SHUTDOWN=true to force-close (e.g. when
+        # permanently stopping the bot, not just restarting).
+        if os.getenv("FLATTEN_ON_SHUTDOWN", "false").lower() == "true":
+            for asset, pos in list(strategy.positions.items()):
+                try:
+                    await strategy._close_position(asset, pos, reason="shutdown")
+                except Exception:
+                    pass
+        elif strategy.positions:
+            dlog(
+                f"Leaving {len(strategy.positions)} position(s) open for recovery on "
+                f"next start: {', '.join(strategy.positions)} "
+                f"(set FLATTEN_ON_SHUTDOWN=true to force-close)",
+                "warn",
+            )
 
         await lt_client.close()
 

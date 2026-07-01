@@ -42,10 +42,14 @@ from core.constants import (
     SPREAD_ENTRY_THRESHOLD,
     SPREAD_EXIT_THRESHOLD,
     SPREAD_EXIT_FLIP,
+    CROSS_FLIP_MIN_HOLD_HOURS,
+    CROSS_FLIP_DEEP_MULT,
     CROSS_EXIT_COOLDOWN_S,
+    CROSS_FLIP_REENTRY_COOLDOWN_S,
     MAKER_CHASE_TIMEOUT_S,
     LT_ENTRY_TIMEOUT_S,
     LT_ENTRY_MAKER_TIMEOUT_S,
+    HL_ENTRY_MAKER_TIMEOUT_S,
     FEE_CROSS_ROUND_TRIP,
     FEE_PERP_MAKER,
     FEE_PERP_TAKER,
@@ -321,7 +325,8 @@ class CrossVenueStrategy:
                         else:
                             lt_px = lt_bid * 0.95 if lt_bid > 0 else 0.0001
                         await self._lt.place_taker(
-                            asset, is_buy=lt_is_buy, size=lt_size, price=lt_px
+                            asset, is_buy=lt_is_buy, size=lt_size, price=lt_px,
+                            reduce_only=True,
                         )
                         log(f"CrossVenue.recover: {asset} Lighter orphan closed (taker) @ {lt_px}")
                     except Exception as e:
@@ -566,6 +571,7 @@ class CrossVenueStrategy:
             is_buy=hl_is_buy,
             size=units,
             side_label=hl_label,
+            timeout_s=HL_ENTRY_MAKER_TIMEOUT_S,  # long maker window — nothing exposed yet
         )
 
         hl_via_taker = False
@@ -774,14 +780,20 @@ class CrossVenueStrategy:
                 if divergence > PRICE_DIVERGENCE_KILL_PCT:
                     log_warn(
                         f"CrossVenue: {asset} PRICE DIVERGENCE {divergence*100:.2f}% "
-                        f"(HL={hl_mid:.4f} LT={lt_mid:.4f}) > {PRICE_DIVERGENCE_KILL_PCT*100:.1f}% — taker exit"
+                        f"(HL={hl_mid:.4f} LT={lt_mid:.4f}) > {PRICE_DIVERGENCE_KILL_PCT*100:.1f}% — "
+                        f"HL maker + LT taker exit"
                     )
                     await self._notify(
                         f"⚠️ <b>Price divergence: {asset}</b>\n"
                         f"HL mid: {hl_mid:.4f} | LT mid: {lt_mid:.4f}\n"
-                        f"Divergence: {divergence*100:.2f}% — closing taker"
+                        f"Divergence: {divergence*100:.2f}% — closing HL maker + LT taker"
                     )
-                    await self._close_position(asset, pos, reason="price_divergence", use_taker=True)
+                    # Delta-neutral: divergence is not a directional loss. Exit HL maker
+                    # (0.015% not 0.045%); Lighter taker is free + instant (HL closes first,
+                    # so no naked window). Same asymmetric close as spread_flip.
+                    await self._close_position(
+                        asset, pos, reason="price_divergence", hl_taker=False, lt_taker=True
+                    )
                     return
         except Exception as e:
             crash_log(f"CrossVenue.divergence_check.{asset}", e)
@@ -807,14 +819,27 @@ class CrossVenueStrategy:
         sign = -1.0 if snap.short_venue != pos.short_venue else 1.0
         effective_spread = sign * decision_abs
 
-        # 1. Hard exit: spread flipped, we're now paying net funding
-        if effective_spread <= SPREAD_EXIT_FLIP and hold_h >= 0.25:
+        # 1. Hard exit: spread flipped, we're now paying net funding.
+        # Funding settles hourly, so we have ~1h of runway — no need to pay HL
+        # taker (0.045%). Chase HL maker (→ taker fallback), Lighter stays taker
+        # (0% fee, instant, avoids naked-leg window). HL flip costs ~0.0001%/h of
+        # funding during the ≤30s chase — negligible vs the 0.03% maker saving.
+        # Anti-churn (2026-06-06): two-tier. A mild flip is usually noise that reverts
+        # within ~1h — exiting at 0.25h banked ≈$0 funding (hourly) and paid a full
+        # round-trip each time (audit: −$0.29 all-time). Wait CROSS_FLIP_MIN_HOLD_HOURS
+        # so a revert can save the round-trip. A DEEP flip (≤ EXIT_FLIP × DEEP_MULT) is a
+        # real regime reversal — bail immediately to stop paying funding.
+        flip_deep = effective_spread <= SPREAD_EXIT_FLIP * CROSS_FLIP_DEEP_MULT
+        if effective_spread <= SPREAD_EXIT_FLIP and (flip_deep or hold_h >= CROSS_FLIP_MIN_HOLD_HOURS):
             log(
                 f"CrossVenue: {asset} SPREAD FLIP exit | "
                 f"effective={effective_spread*100:.4f}%/h ({twap_label}, "
-                f"instant={instant_abs*100:.4f}%/h)"
+                f"instant={instant_abs*100:.4f}%/h) "
+                f"{'DEEP' if flip_deep else f'mild hold={hold_h:.2f}h'}"
             )
-            await self._close_position(asset, pos, reason="spread_flip", use_taker=True)
+            await self._close_position(
+                asset, pos, reason="spread_flip", hl_taker=False, lt_taker=True
+            )
             return
 
         # 2. Soft exit: spread too small to justify staying
@@ -841,23 +866,40 @@ class CrossVenueStrategy:
         pos: CrossVenuePosition,
         reason: str,
         use_taker: bool = False,
+        hl_taker: bool | None = None,
+        lt_taker: bool | None = None,
     ) -> None:
-        """Close both legs of a cross-venue position."""
+        """Close both legs of a cross-venue position.
+
+        Per-leg taker control: `hl_taker`/`lt_taker` override `use_taker` for a
+        single leg. Used by spread_flip to exit HL maker (saves 0.045%→0.015%)
+        while keeping Lighter taker (Lighter taker is 0% — free *and* instant, so
+        no point maker-chasing it, and it avoids a naked-leg window: HL closes
+        first, so a slow Lighter maker-chase would leave us directional for up to
+        MAKER_CHASE_TIMEOUT_S). HL is chased first while both legs are still on,
+        keeping us delta-neutral until HL fills.
+        """
         if pos.state == CrossVenueState.EXITING:
             return
         pos.state = CrossVenueState.EXITING
+
+        if hl_taker is None:
+            hl_taker = use_taker
+        if lt_taker is None:
+            lt_taker = use_taker
 
         hl_is_short  = pos.short_venue == "hl"
         hl_close_buy = hl_is_short   # close short → buy back; close long → sell
         lt_close_buy = not hl_close_buy
 
-        log(f"CrossVenue: closing {asset} | reason={reason} taker={use_taker}")
+        log(f"CrossVenue: closing {asset} | reason={reason} hl_taker={hl_taker} lt_taker={lt_taker}")
 
-        # Close HL leg
-        hl_ok = await self._close_hl_leg(asset, pos, hl_close_buy, use_taker)
+        # Close HL leg first — while both legs are still open we stay delta-neutral
+        # during the maker chase. Only after HL closes is the Lighter leg directional.
+        hl_ok = await self._close_hl_leg(asset, pos, hl_close_buy, hl_taker)
 
         # Close Lighter leg
-        lt_ok = await self._close_lt_leg(asset, pos, lt_close_buy, use_taker)
+        lt_ok = await self._close_lt_leg(asset, pos, lt_close_buy, lt_taker)
 
         if not hl_ok:
             log_warn(f"CrossVenue: {asset} HL close FAILED — may need manual intervention")
@@ -875,11 +917,15 @@ class CrossVenueStrategy:
         if hl_ok and lt_ok:
             self._stats.successful_cycles += 1
 
-        # Remove from active positions and set cooldown
+        # Remove from active positions and set cooldown. After a flip, hold the asset
+        # in a longer cooldown so we don't bounce back into the same reversing spread.
         self.positions.pop(asset, None)
         self._lt_last_funding_poll.pop(asset, None)
         self._lt_collateral_at_entry.pop(asset, None)
-        self._set_cooldown(asset)
+        if reason == "spread_flip":
+            self._set_cooldown(asset, CROSS_FLIP_REENTRY_COOLDOWN_S)
+        else:
+            self._set_cooldown(asset)
 
         await self._notify(
             f"🔴 <b>CrossVenue: {asset} CLOSED</b> [{reason}]\n"
@@ -1349,6 +1395,34 @@ class CrossVenueStrategy:
                     await self._close_position(
                         asset, pos, reason="drift_orphan", use_taker=True
                     )
+                    continue
+
+                # Over-sized Lighter leg → excess is unhedged directional risk. Trim it
+                # back to the booked size with a reduce-only taker immediately, instead of
+                # holding it until exit (the gap that left MON 2× unhedged for 15 min on
+                # 2026-06-05: a maker_chase cancel-race double-filled the Lighter leg).
+                # reduce_only can only shrink the position, never flip it.
+                lt_excess = lt_size - expected
+                if lt_excess > expected * DRIFT_TOLERANCE_PCT:
+                    try:
+                        reduce_buy_lt = not (pos.short_venue == "hl")
+                        lt_bid, lt_ask = await self._lt.get_best_prices(asset)
+                        px = (lt_ask * 1.05 if reduce_buy_lt else lt_bid * 0.95)
+                        await self._lt.place_taker(
+                            asset, is_buy=reduce_buy_lt, size=lt_excess, price=px, reduce_only=True
+                        )
+                        log_warn(
+                            f"CrossVenue: {asset} Lighter leg OVER-sized "
+                            f"({lt_size:.4f} vs booked {expected:.4f}) — trimmed "
+                            f"{lt_excess:.4f} reduce-only to restore delta-neutral"
+                        )
+                        await self._notify(
+                            f"🔧 <b>{asset} over-sized leg trimmed</b>\n"
+                            f"Lighter {lt_size:.4f} → ~{expected:.4f} (excess {lt_excess:.4f}). "
+                            f"Likely a maker double-fill; delta-neutral restored."
+                        )
+                    except Exception as e:
+                        crash_log(f"CrossVenue.drift_trim.{asset}", e)
 
     # ── Exchange-truth reconciliation (P0) ────────────────────────────────────
 
@@ -1485,8 +1559,8 @@ class CrossVenueStrategy:
 
     # ── Utilities ─────────────────────────────────────────────────────────────
 
-    def _set_cooldown(self, asset: str) -> None:
-        self._entry_cooldowns[asset] = int(time.time()) + CROSS_EXIT_COOLDOWN_S
+    def _set_cooldown(self, asset: str, cooldown_s: int = CROSS_EXIT_COOLDOWN_S) -> None:
+        self._entry_cooldowns[asset] = int(time.time()) + cooldown_s
 
     async def _register_entry_fail(self, asset: str, reason: str) -> None:
         """Count consecutive entry failures (HL timeout OR Lighter ghost) per asset.

@@ -25,16 +25,22 @@ Updated: 2026-05-30
 | CROSS_MIN_HOLD_HOURS | 8h | минимум перед soft-exit |
 | CROSS_MAX_HOLD_HOURS | 48h | максимум |
 | CROSS_EXIT_COOLDOWN_S | 900s | 15 мин пауза после выхода |
-| SPREAD_ENTRY_THRESHOLD | 0.00005 (0.005%/h, ~44% APR) | минимальный исторический спред для входа |
+| SPREAD_ENTRY_THRESHOLD | **0.00008 (0.008%/h, ~70% APR)** | мин. спред входа (поднят 2026-06-05 с 0.005% — был ровно на 8h-maker-безубытке, нулевой запас) |
 | SPREAD_EXIT_THRESHOLD | 0.00002 (0.002%/h) | soft-exit (maker) |
-| SPREAD_EXIT_FLIP | -0.00002 | hard-exit (taker) при флипе |
+| SPREAD_EXIT_FLIP | **-0.00005 (-0.005%/h)** | hard-exit при флипе. Расширен 2026-06-05 с -0.002% (≈0 → churn TRX 3× за 11ч). Выход: HL maker + LT taker |
+| CROSS_FLIP_MIN_HOLD_HOURS | **1.5h** | анти-чурн (2026-06-06): мелкий флип ждёт реверта 1.5ч вместо 0.25ч |
+| CROSS_FLIP_DEEP_MULT | **3.0** | глубокий флип (≤ EXIT_FLIP×3 = −0.015%/h) выходит сразу, минуя floor |
+| PERSISTENCE_FEE_MULT | **1.3** | вход только если Σspread за max-серию-подряд ≥ FEE_CROSS_ROUND_TRIP×1.3 (persistence gate ВНЕДРЁН 2026-06-06) |
+| CROSS_FLIP_REENTRY_COOLDOWN_S | **14400 (4ч)** | длинный cooldown на ТОТ ЖЕ актив после flip (2026-06-05, против churn) |
+| HL_ENTRY_MAKER_TIMEOUT_S | **60s** | длинное maker-окно HL-входа (первая нога, ничего не открыто) — режет taker fallback (2026-06-05) |
+| PRICE_DIVERGENCE_KILL_PCT | **0.04 (4%)** | поднят 2026-06-05 с 2% (false-positive на дельта-нейтрали). Выход теперь HL maker + LT taker, не оба taker |
 | SPREAD_TWAP_WINDOW_S | 1800s (30 мин) | окно TWAP gate |
 | SPREAD_TWAP_MIN_SAMPLES | 20 | ~10 мин прогрева (fail-closed) |
 | STABILITY_LOOKBACK_HOURS | 24 | часов истории HL settlements |
 | STABILITY_MIN_HIT_RATIO | 0.25 | 25% часов выше threshold (было 0.50 — захардкожено, исправлено) |
 | MAKER_CHASE_TIMEOUT_S | 30s | таймаут cover-leg / выхода |
 | LT_ENTRY_TIMEOUT_S | 90s | таймаут Lighter entry leg (дольше — HL захеджирован) |
-| CROSS_VENUE_WHITELIST | 21 tier-1 активов | BTC ETH SOL BNB XRP DOGE ADA AVAX LINK DOT AAVE BCH LTC ATOM UNI SUI ARB OP APT TAO NEAR |
+| CROSS_VENUE_WHITELIST | **67 активов** (verified 2026-06-03) | расширен с 21 tier-1: все пары HL+Lighter maxLev≥5x, OI>$1M |
 | Network | **MAINNET** | HL_TESTNET=false |
 
 ---
@@ -91,10 +97,19 @@ sqlite3 database/carry.db "SELECT asset, round((strftime('%s','now')-entered_at)
    → если всё равно None: 6s ZK-lag guard → проверяем позицию — только потом `_cover_naked_hl_leg`
 6. 3 подряд провала (HL leg unfillable / Lighter genuinely failed) → 4h blacklist через `_entry_fail_streak`
 
-### Выход
-- `spread_flip` (TWAP ≤ EXIT_FLIP): **taker** немедленно
-- `spread_soft_exit` (TWAP ≤ EXIT_THRESHOLD, hold ≥ 8h): **maker**
+### Выход (`cross_venue_carry.py:806-833`)
+**КЛЮЧЕВОЕ — sign-flip, не модуль.** `effective_spread = sign * |TWAP|`, где
+`sign = -1 if snap.short_venue != pos.short_venue else +1`. Магнитуда TWAP/instant
+**всегда положительна**; выход по флипу триггерит **смена выгодного направления шорта**
+(сканер говорит «теперь шорти другую биржу») → наша позиция начинает платить фандинг.
+- `spread_flip` (effective ≤ EXIT_FLIP=-0.00005): **анти-чурн 2026-06-06 — два уровня.** Мелкий флип (шум) ждёт `CROSS_FLIP_MIN_HOLD_HOURS=1.5h` (даём реверту шанс, не платим лишний round-trip); глубокий флип (≤ EXIT_FLIP×`CROSS_FLIP_DEEP_MULT`=3 → −0.015%/h, реальный разворот) выходит сразу. Закрытие: **HL maker-chase (→taker fallback) + Lighter taker**. Раньше было `hold ≥ 0.25h` → чурн (15/25 циклов, −$0.20)
+- `spread_soft_exit` (effective ≤ EXIT_THRESHOLD=0.00002, hold ≥ 8h): **maker**
 - `max_hold` (48h): **maker**
+- `price_divergence` (|HL mid − LT mid| > 2%): **taker** немедленно
+
+⚠️ **ГРАБЛИ ЛОГА:** строка `SPREAD FLIP exit | effective=-0.0097%/h (TWAP=0.0097%/h, instant=0.0080%/h)`
+печатает TWAP/instant как **модуль** (всегда «+»), а effective — со знаком. Выглядит как
+«оба плюс, а вышел» — но это НЕ баг: направление развернулось. Не расследовать заново.
 
 ---
 
@@ -113,6 +128,10 @@ sqlite3 database/carry.db "SELECT asset, round((strftime('%s','now')-entered_at)
 - [Change Diary](log.md)
 - [Yield Landscape & 3 рычага](yield_landscape.md) ← почему carry скромен + где апсайд (ресерч 2026-05-30)
 - [Persistence Gate](persistence_gate.md) ← серия часов подряд > hit_ratio, режет убыточные входы (2026-05-31)
+- [Strategy Options 2026-06](strategy_options_2026-06.md) ← deep research: чурн-диагноз + 3 пути (carry-фикс / points-farming / гибрид), HL S3 live (2026-06-06)
+- [Broad Research 2026-06-10](research_2026-06-10_monetization.md) ← clean-slate ресёрч A-E: TOP-1 мульти-venue farming (Ondo Perps/Pacifica/Paradex), TOP-2 Polymarket-арб; полная таблица отброшенного
+- [InsiderScanner Verdict](insider_scanner_verdict.md) ← бэктест 1.1M сигналов: инсайдеры реальны (+7.8% edge на лонгшотах), но follow мёртв — маркет-импакт съедает edge до детекта
+- [Implementation Plan 2026-06](impl_plan_2026-06.md) ← verified fees всех venue, формула Polymarket Liquidity Rewards, weekend-механика Ondo, протокол InsiderScanner v2 с пре-регистрацией
 - [Leverage & Margin](leverage_and_margin.md) ← плечо 10x cross на ОБЕИХ биржах (НЕ PERP_LEVERAGE=3), per-venue ликвидация, капитал перекошен HL $5.76 / Lighter $100 (verified live 2026-06-02)
 
-**WHITELIST UPDATE (2026-06-02):** Расширен 21→70 активов — все пары HL+Lighter с maxLev≥5x и OI>$1M. Instant scan теперь видит 30 кандидатов против 1 (BCH). Исторический фильтр всё равно gate-ит по 24h avg hits.
+**WHITELIST UPDATE (2026-06-02, verified count 2026-06-03):** Расширен 21→**67** активов — все пары HL+Lighter с maxLev≥5x и OI>$1M. Instant scan видит ~30 кандидатов против 1 (BCH). Исторический фильтр всё равно gate-ит по 24h avg hits.

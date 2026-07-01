@@ -61,6 +61,9 @@ MAKER_CHASE_TIMEOUT_S: float = 30.0      # Total time before taker fallback on c
 MAKER_EXIT_TIMEOUT_S: float = 120.0      # Total time for maker exit before taker fallback
 LT_ENTRY_TIMEOUT_S: float = 90.0        # Lighter entry leg: longer wait since HL is hedged
 LT_ENTRY_MAKER_TIMEOUT_S: float = 15.0  # Maker window before taker fallback (Lighter taker = 0%)
+HL_ENTRY_MAKER_TIMEOUT_S: float = 60.0  # HL is the FIRST leg — nothing is exposed until it fills,
+#   so we can afford a long maker window before the 0.045% taker fallback. Added 2026-06-05 to
+#   cut taker-entry leakage (23 fallbacks in history tripled entry fee 0.015%→0.045%).
 SPOT_TAKER_FALLBACK_S: float = 20.0      # Spot maker timeout before emergency taker buy (naked short prevention)
 
 # ── Funding scanner ──────────────────────────────────────────────────────────
@@ -125,9 +128,14 @@ LIGHTER_EXPLORER_URL: str = "https://explorer.elliot.ai/api"
 # matching podcast practitioner baseline ("50-100% годовых средняя доходность").
 # Break-even math @ $25/leg: 0.005% × $25 = $0.00125/h vs $0.0074 round-trip fees →
 # 5.9h to recoup — safe with CROSS_MIN_HOLD_HOURS=8.
-SPREAD_ENTRY_THRESHOLD: float = 0.00005    # 0.005%/h (~44% APR) — realistic sustained carry
+SPREAD_ENTRY_THRESHOLD: float = 0.00008    # 0.008%/h (~70% APR) — raised 2026-06-05 from 0.005%.
+#   0.005% sat exactly on the 8h-maker breakeven (0.00375%/h) → zero margin, marginal
+#   assets (ADA 24h-avg 0.0045) bled fees. 0.008% × 8h = 0.064% income vs 0.03% maker
+#   round-trip → guaranteed +0.034% even if held only the 8h floor. Fewer trades, each net+.
 SPREAD_EXIT_THRESHOLD: float  = 0.00002    # 0.002%/h (~17.5% APR) — exit when carry decays
-SPREAD_EXIT_FLIP: float       = -0.00002   # -0.002%/h — hard flip (taker close immediately)
+SPREAD_EXIT_FLIP: float       = -0.00005   # -0.005%/h — hard flip. Widened 2026-06-05 from
+#   -0.002% (≈0): the old near-zero band triggered on noise → TRX churned in/out 3× in 11h,
+#   paying full fees each round. -0.005% requires a real direction reversal, not a wobble.
 
 # Maximum allowed bid-ask spread on Lighter order book before entry.
 # If Lighter's top-of-book spread is wider than this, skip the asset
@@ -212,6 +220,28 @@ SPREAD_SCAN_INTERVAL_S: int = 30
 # same asset right after exit when its spike-then-revert pattern is still active.
 CROSS_EXIT_COOLDOWN_S: int = 900
 
+# Longer re-entry cooldown on the SAME asset after a spread_flip exit. A flip means
+# the funding direction just reversed; re-entering 15 min later (the old behaviour)
+# bounced straight back into the same decaying/oscillating spread and paid fees again
+# (TRX in/out 3× in 11h). 4h lets the regime actually change before we touch it again.
+CROSS_FLIP_REENTRY_COOLDOWN_S: int = 14400  # 4h same-asset cooldown after spread_flip
+
+# ── Anti-churn: flip-exit hold floor (2026-06-06) ────────────────────────────
+# AUDIT 2026-06-06: 15/25 closed cycles exited on spread_flip at hold≥0.25h (15 min),
+# banking ≈$0 funding (hourly settlement) and paying a full round-trip fee each time →
+# net −$0.29 all-time. Funding flips are mostly NOISE that reverts (ZK/MON re-opened
+# within hours). Two-tier flip exit:
+#   • mild flip (noise): wait CROSS_FLIP_MIN_HOLD_HOURS so a revert can save the round-trip.
+#   • deep flip (real regime reversal, ≤ SPREAD_EXIT_FLIP × DEEP_MULT): exit immediately.
+CROSS_FLIP_MIN_HOLD_HOURS: float = 1.5   # mild-flip hold floor before acting (was 0.25h)
+CROSS_FLIP_DEEP_MULT: float      = 3.0   # ×SPREAD_EXIT_FLIP (−0.015%/h) = real reversal → exit now
+
+# ── Persistence gate (entry) — implements persistence_gate.md (designed 2026-05-31) ──
+# hit_ratio cannot tell an 8h continuous block from 8 scattered 1h hits. Break-even needs
+# N CONSECUTIVE hours. Require the cumulative spread over the longest consecutive run above
+# threshold to exceed the round-trip fee with margin, else the carry never reaches break-even.
+PERSISTENCE_FEE_MULT: float = 1.3        # required run_earn ≥ FEE_CROSS_ROUND_TRIP × 1.3
+
 # ── Anti-spike entry filter (borrowed from Gajesh2007/funding-arb-bot) ───────
 # Reject entry if current spread > rolling_mean + N*sigma — funding spike
 # is likely to revert before MIN_HOLD elapses, leaving you holding the bag.
@@ -245,7 +275,11 @@ STABILITY_MIN_HIT_RATIO: float  = 0.25    # 25% of past hours must be above thre
 # If HL mid and Lighter mid for the same asset diverge by > this %, one venue's
 # oracle is broken or there is a real arb that the funding model cannot model.
 # Exit immediately (taker) to avoid getting stuck with a non-hedged book.
-PRICE_DIVERGENCE_KILL_PCT: float = 0.02   # 2% mid-price divergence triggers taker exit
+PRICE_DIVERGENCE_KILL_PCT: float = 0.04   # 4% mid-price divergence. Raised 2026-06-05 from 2%:
+#   the position is delta-neutral, so a 2-3% mid divergence between venues is NOT a loss
+#   (leg PnL offsets) — it was usually transient quote-noise on a thin book. The old 2% +
+#   taker-both-legs turned 4 neutral positions into guaranteed fee losses (ZEC twice in 27min).
+#   4% keeps a safety net for a genuine oracle break; exit is now HL-maker + LT-taker, not taker-both.
 
 # ── Portfolio drawdown kill switch ────────────────────────────────────────────
 # If cumulative session P&L drops below this floor, halt all new entries and

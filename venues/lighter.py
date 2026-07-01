@@ -697,22 +697,26 @@ class LighterClient:
                     f"cancel failed at attempt {attempt+1} — aborting to prevent order accumulation"
                 )
                 return None
-            if cancelled is None:
-                # Order not found on book — could be (a) filled but position not yet settled on-chain,
-                # or (b) order still pending in ZK rollup mempool. Wait 2s for state to propagate.
-                await asyncio.sleep(2.0)
-                pos2 = await self.get_position_for_asset(asset)
-                if pos2 is not None:
-                    sz2 = abs(float(pos2.get("size", 0) or pos2.get("base_amount", 0)))
-                    if closing:
-                        if (pre_size - sz2) >= size * 0.9:
-                            log(f"LighterClient.maker_chase: {label_str}{asset} CLOSE FILLED (post-cancel lag @ {price})")
-                            return order_id
-                    else:
-                        if (sz2 - pre_size) >= size * 0.9:
-                            log(f"LighterClient.maker_chase: {label_str}{asset} FILLED (post-cancel lag @ {price})")
-                            return order_id
-                # Still not visible — order was likely pending (not filled), safe to repost.
+            # Verify fill after cancel REGARDLESS of cancel's return value. On Lighter's
+            # ZK rollup the fill and the cancel-ack can land in the same block, so
+            # cancel_order returns "OK" for an order that already FILLED. The old code
+            # only re-checked when cancel returned None (not-found) → a cancel-OK race
+            # slipped through, the loop reposted, and we got a DOUBLE fill / 2× leg
+            # (BUG 2026-06-05: MON booked 1155.8, Lighter actual 2311.6 → 15 min unhedged).
+            # Always wait for ZK settle and compare position delta before reposting.
+            await asyncio.sleep(2.0)
+            pos2 = await self.get_position_for_asset(asset)
+            if pos2 is not None:
+                sz2 = abs(float(pos2.get("size", 0) or pos2.get("base_amount", 0)))
+                if closing:
+                    if (pre_size - sz2) >= size * 0.9:
+                        log(f"LighterClient.maker_chase: {label_str}{asset} CLOSE FILLED (post-cancel @ {price})")
+                        return order_id
+                else:
+                    if (sz2 - pre_size) >= size * 0.9:
+                        log(f"LighterClient.maker_chase: {label_str}{asset} FILLED (post-cancel @ {price})")
+                        return order_id
+            # Still not filled — order was pending, not executed. Safe to repost.
 
         log_warn(f"LighterClient.maker_chase: {label_str}{asset} exhausted {max_reposts} reposts")
         # Final cleanup cancel — make sure nothing lingers on the book.
