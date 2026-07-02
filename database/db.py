@@ -4,7 +4,7 @@ from __future__ import annotations
 import os
 import aiosqlite
 
-_DB_PATH: str = os.getenv("DB_PATH", "/root/projects/HLCarryBot/database/carry.db")
+_DB_PATH: str = os.getenv("DB_PATH", "./database/carry.db")
 _SCHEMA_PATH: str = os.path.join(os.path.dirname(__file__), "schema.sql")
 
 
