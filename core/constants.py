@@ -125,7 +125,7 @@ LIGHTER_EXPLORER_URL: str = "https://explorer.elliot.ai/api"
 #   BCH 0.0056%/h, ADA 0.0045, DOT 0.0031, APT 0.0024, BNB 0.0018, AVAX 0.0010
 # Threshold 0.025%/h would block 100% of assets on a quiet market → bot idle.
 # At 0.005%/h (44% APR) about half the whitelist would qualify in normal regimes,
-# matching podcast practitioner baseline ("50-100% годовых средняя доходность").
+# matching podcast practitioner baseline ("50-100% average annual yield").
 # Break-even math @ $25/leg: 0.005% × $25 = $0.00125/h vs $0.0074 round-trip fees →
 # 5.9h to recoup — safe with CROSS_MIN_HOLD_HOURS=8.
 SPREAD_ENTRY_THRESHOLD: float = 0.00008    # 0.008%/h (~70% APR) — raised 2026-06-05 from 0.005%.
@@ -264,7 +264,7 @@ SPREAD_TWAP_MIN_SAMPLES: int = 20  # ~10 min of samples at 30s scan interval (fa
 # hourly TWAP settlements and require ≥60% of recent hours to have been above
 # threshold in our shorting direction. If NEAR averaged 0.0007%/h for 24h with
 # max 0.0013%/h, no number of TWAP-confirmed spikes makes it a real carry.
-# Per podcast wisdom: "стабильный фандинг в течение месяца" — the sustainable
+# Per podcast wisdom: "stable funding sustained over a month" — the sustainable
 # pattern. NEAR live data: 0/24 settlements ≥ 0.025% → would have been rejected.
 STABILITY_LOOKBACK_HOURS: int   = 24      # hours of HL settlement history to inspect
 STABILITY_MIN_HIT_RATIO: float  = 0.25    # 25% of past hours must be above threshold
